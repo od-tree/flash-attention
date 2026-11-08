@@ -169,6 +169,30 @@ class WorkTileInfo(cutlass.utils.WorkTileInfo):
         return WorkTileInfo(new_tile_idx, new_is_valid_tile)
 
 
+def apply_head_tp_skip(params, head_idx, batch_idx, is_valid):
+    """Drop a tile before the FA4 mainloop. Same rule as FA2 head_tp_tile_active.
+
+    Single-tile schedulers only: one CTA owns one tile, so marking it invalid
+    does not abandon later tiles. Persistent schedulers are left unchanged.
+    """
+    if const_expr(params.head_tp_row_kind is None):
+        return is_valid
+    kind = Int32(params.head_tp_row_kind[batch_idx])
+    if kind == Int32(2):
+        return False
+    if kind == Int32(0):
+        return is_valid
+    if kind != Int32(1) or const_expr(params.head_tp_q_range is None):
+        return False
+    q_head = head_idx * params.head_tp_qhead_per_kvhead
+    base = (batch_idx * params.head_tp_dp_size) * Int32(2)
+    q_begin = params.head_tp_q_range[base]
+    q_end = params.head_tp_q_range[base + Int32(1)]
+    if q_head < q_begin or q_head >= q_end:
+        return False
+    return is_valid
+
+
 @runtime_checkable
 class TileSchedulerProtocol(Protocol):
     """Protocol defining the interface all tile schedulers must implement.
@@ -248,6 +272,12 @@ class TileSchedulerArguments(ParamsBase):
     # every batch's first splits launch before the excess splits, which exit at once. Cluster
     # shape (1, 1) only.
     split_major: cutlass.Constexpr[bool] = False
+    # Head-TP. None keeps every tile. row_kind is int32 [batch]: 0 local, 1 owner, 2 empty.
+    # q_range is int32 [batch, dp_size, 2] flattened, shard 0 only.
+    head_tp_row_kind: Optional[cute.Tensor] = None
+    head_tp_q_range: Optional[cute.Tensor] = None
+    head_tp_dp_size: Int32 = Int32(0)
+    head_tp_qhead_per_kvhead: cutlass.Constexpr[int] = 1
 
 
 class SingleTileScheduler:
@@ -263,6 +293,10 @@ class SingleTileScheduler:
         use_cluster_idx: cutlass.Constexpr[bool] = False
         num_splits_dynamic_ptr: Optional[cute.Tensor] = None
         num_head_divmod: Optional[FastDivmodDivisorV2] = None  # split-major grid
+        head_tp_row_kind: Optional[cute.Tensor] = None
+        head_tp_q_range: Optional[cute.Tensor] = None
+        head_tp_dp_size: Int32 = Int32(0)
+        head_tp_qhead_per_kvhead: cutlass.Constexpr[int] = 1
 
         @staticmethod
         def create(
@@ -279,6 +313,10 @@ class SingleTileScheduler:
                 args.use_cluster_idx,
                 args.num_splits_dynamic_ptr,
                 FastDivmodDivisorV2(args.num_head) if args.split_major else None,
+                head_tp_row_kind=args.head_tp_row_kind,
+                head_tp_q_range=args.head_tp_q_range,
+                head_tp_dp_size=args.head_tp_dp_size,
+                head_tp_qhead_per_kvhead=args.qhead_per_kvhead_packgqa,
             )
 
     def __init__(self, params: Params, blk_coord: cute.Coord, *, loc=None, ip=None):
@@ -359,7 +397,7 @@ class SingleTileScheduler:
                 split_idx = split_idx | (num_splits << 16)
         return WorkTileInfo(
             (block_idx, head_idx, batch_idx, split_idx),
-            is_valid,
+            apply_head_tp_skip(self.params, head_idx, batch_idx, is_valid),
         )
 
     def initial_work_tile_info(self, *, loc=None, ip=None):
@@ -527,6 +565,10 @@ class SingleTileLPTScheduler:
         lpt: cutlass.Constexpr[bool] = True
         use_cluster_idx: cutlass.Constexpr[bool] = True
         num_splits_dynamic_ptr: Optional[cute.Tensor] = None
+        head_tp_row_kind: Optional[cute.Tensor] = None
+        head_tp_q_range: Optional[cute.Tensor] = None
+        head_tp_dp_size: Int32 = Int32(0)
+        head_tp_qhead_per_kvhead: cutlass.Constexpr[int] = 1
 
         @staticmethod
         @cute.jit
@@ -580,6 +622,10 @@ class SingleTileLPTScheduler:
                 lpt=args.lpt,
                 use_cluster_idx=args.use_cluster_idx,
                 num_splits_dynamic_ptr=args.num_splits_dynamic_ptr,
+                head_tp_row_kind=args.head_tp_row_kind,
+                head_tp_q_range=args.head_tp_q_range,
+                head_tp_dp_size=args.head_tp_dp_size,
+                head_tp_qhead_per_kvhead=args.qhead_per_kvhead_packgqa,
             )
 
     def __init__(
@@ -680,7 +726,8 @@ class SingleTileLPTScheduler:
             tile_idx = work.tile_idx[0] + self.params.num_block * (
                 work.tile_idx[1] + self.params.num_head * work.tile_idx[2]
             )
-            return WorkTileInfo(self._static_coords(tile_idx).tile_idx, work.is_valid_tile)
+            info = self._static_coords(tile_idx)
+            return WorkTileInfo(info.tile_idx, work.is_valid_tile and info.is_valid_tile)
         assert self.params.cluster_shape_m == 1 or self.params.use_cluster_idx, (
             "CLC with clusters requires use_cluster_idx"
         )
@@ -702,7 +749,7 @@ class SingleTileLPTScheduler:
                 split_idx = split_idx | (num_splits << 16)
         return WorkTileInfo(
             (Int32(block_idx), Int32(work.tile_idx[1]), Int32(batch_idx), Int32(split_idx)),
-            work.is_valid_tile,
+            apply_head_tp_skip(self.params, work.tile_idx[1], batch_idx, work.is_valid_tile),
         )
 
     @cute.jit
@@ -739,7 +786,8 @@ class SingleTileLPTScheduler:
                 num_splits = Int32(params.num_splits_dynamic_ptr[batch_idx])
                 split_idx = split_idx | (num_splits << 16)
         return WorkTileInfo(
-            (Int32(block), Int32(head_idx), Int32(batch_idx), Int32(split_idx)), is_valid
+            (Int32(block), Int32(head_idx), Int32(batch_idx), Int32(split_idx)),
+            apply_head_tp_skip(params, head_idx, batch_idx, is_valid),
         )
 
     @cute.jit
@@ -1263,6 +1311,10 @@ class SingleTileVarlenScheduler:
         total_q: Int32
         scheduling_mode: cutlass.Constexpr[SchedulingMode]
         decoder: VarlenDecoder
+        head_tp_row_kind: Optional[cute.Tensor] = None
+        head_tp_q_range: Optional[cute.Tensor] = None
+        head_tp_dp_size: Int32 = Int32(0)
+        head_tp_qhead_per_kvhead: cutlass.Constexpr[int] = 1
 
         @staticmethod
         @cute.jit
@@ -1295,6 +1347,10 @@ class SingleTileVarlenScheduler:
                 total_q=args.total_q,
                 scheduling_mode=scheduling_mode,
                 decoder=decoder,
+                head_tp_row_kind=args.head_tp_row_kind,
+                head_tp_q_range=args.head_tp_q_range,
+                head_tp_dp_size=args.head_tp_dp_size,
+                head_tp_qhead_per_kvhead=args.qhead_per_kvhead_packgqa,
             )
 
     def __init__(
@@ -1389,6 +1445,7 @@ class SingleTileVarlenScheduler:
                 num_splits = Int32(d.num_splits_dynamic_ptr[batch_idx])
                 split_idx = split_idx | (num_splits << 16)
         tile_idx = (Int32(block), Int32(head_idx), Int32(batch_idx), Int32(split_idx))
+        is_valid = apply_head_tp_skip(self.params, head_idx, batch_idx, is_valid)
         if const_expr(d.nested_mbh_coord):
             tile_idx = (Int32(block), Int32(0), (Int32(head_idx), Int32(batch_idx)))
         return WorkTileInfo(tile_idx, is_valid)

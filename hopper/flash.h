@@ -174,6 +174,11 @@ struct Flash_fwd_params : public Qkv_params {
     int cp_world_size;
     int cp_rank;
     int *__restrict__ cp_tot_seqused_k;
+
+    // Head-TP tile predicate. Null keeps every tile. See head_tp_skip.h.
+    int8_t *__restrict__ head_tp_row_kind = nullptr;
+    int *__restrict__ head_tp_q_range = nullptr;
+    int head_tp_dp_size = 0;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

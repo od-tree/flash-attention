@@ -693,6 +693,9 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         output_scale: Optional[cute.Tensor] = None,
         mCuTotalMBlocks: Optional[cute.Tensor] = None,
         mCuTotalSplitsMBlocks: Optional[cute.Tensor] = None,
+        mHeadTpRowKind: Optional[cute.Tensor] = None,
+        mHeadTpQRange: Optional[cute.Tensor] = None,
+        head_tp_dp_size: Int32 = Int32(0),
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -761,6 +764,9 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             mSeqUsedQ=mSeqUsedQ,
             cu_total_m_blocks_ptr=mCuTotalMBlocks,
             cu_total_splits_m_blocks_ptr=mCuTotalSplitsMBlocks,
+            head_tp_row_kind=mHeadTpRowKind,
+            head_tp_q_range=mHeadTpQRange,
+            head_tp_dp_size=head_tp_dp_size,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)

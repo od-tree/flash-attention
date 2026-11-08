@@ -177,6 +177,9 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     typename AttnKernel::Params kernel_params = AttnKernel::to_underlying_arguments({
         mainloop_args, epilogue_args, {device, params.num_sm}, scheduler_args
     });
+    kernel_params.head_tp_row_kind = params.head_tp_row_kind;
+    kernel_params.head_tp_q_range = params.head_tp_q_range;
+    kernel_params.head_tp_dp_size = params.head_tp_dp_size;
 
     dim3 grid_dims = AttnKernel::get_grid_shape(kernel_params);
     dim3 block_dims = AttnKernel::get_block_shape();

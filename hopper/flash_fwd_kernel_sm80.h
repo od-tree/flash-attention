@@ -14,6 +14,7 @@
 #include "seqlen.h"
 #include "utils.h"
 #include "softmax.h"
+#include "head_tp_skip.h"
 
 namespace flash {
 
@@ -101,6 +102,9 @@ public:
         EpilogueParams epilogue{};
         cutlass::KernelHardwareInfo hw_info{};
         TileSchedulerParams scheduler{};
+        int8_t *__restrict__ head_tp_row_kind = nullptr;
+        int *__restrict__ head_tp_q_range = nullptr;
+        int head_tp_dp_size = 0;
     };
 
     //
@@ -171,6 +175,14 @@ public:
             // If there's tanh softcap, the scaling will be done before tanh.
             auto block_coord = work_tile_info.get_block_coord(params.scheduler);
             int const bidb = get<2>(block_coord);
+            if (!head_tp_tile_active(
+                    params,
+                    bidb,
+                    !PackGQA ? get<1>(block_coord)
+                             : get<1>(block_coord) * params.mainloop.qhead_per_khead_divmod.divisor)) {
+                scheduler.prefetch_next_work(params.scheduler, work_tile_info);
+                continue;
+            }
             if constexpr (Is_FP8 && !Has_softcap) {
                 int const bidh = get<1>(block_coord);
                 int const bidh_kv = !PackGQA ? params.mainloop.qhead_per_khead_divmod.divide(bidh) : bidh;

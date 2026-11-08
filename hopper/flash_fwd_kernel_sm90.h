@@ -19,6 +19,7 @@
 #include "seqlen.h"
 #include "utils.h"
 #include "softmax.h"
+#include "head_tp_skip.h"
 
 namespace flash {
 
@@ -136,6 +137,9 @@ public:
         EpilogueParams epilogue{};
         cutlass::KernelHardwareInfo hw_info{};
         TileSchedulerParams scheduler{};
+        int8_t *__restrict__ head_tp_row_kind = nullptr;
+        int *__restrict__ head_tp_q_range = nullptr;
+        int head_tp_dp_size = 0;
     };
 
     //
@@ -342,6 +346,16 @@ public:
                  work_tile_info = SingleProducerWarp || warp_idx_in_warpgroup == 0 ? scheduler.template get_next_work</*IsProducerWarp=*/true>(params.scheduler, work_tile_info) : scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info)) {
 
                 auto block_coord = work_tile_info.get_block_coord(params.scheduler);
+                if (!head_tp_tile_active(
+                        params,
+                        get<2>(block_coord),
+                        !PackGQA ? get<1>(block_coord)
+                                 : get<1>(block_coord) * params.mainloop.qhead_per_khead_divmod.divisor)) {
+                    if (SingleProducerWarp || warp_idx_in_warpgroup == 0) {
+                        scheduler.prefetch_next_work(params.scheduler, work_tile_info);
+                    }
+                    continue;
+                }
                 SeqlenInfo_t seqlen_info{
                     get<2>(block_coord) /*bidb*/,
                     get<0>(params.mainloop.shape_Q),
@@ -394,6 +408,19 @@ public:
                  ) {
                 auto block_coord = work_tile_info.get_block_coord(params.scheduler);
                 int const bidb = get<2>(block_coord);
+                if (!head_tp_tile_active(
+                        params,
+                        bidb,
+                        !PackGQA ? get<1>(block_coord)
+                                 : get<1>(block_coord) * params.mainloop.qhead_per_khead_divmod.divisor)) {
+                    work_tile_info = scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info);
+                    if constexpr (Split && Varlen) {
+                        if (!work_tile_info.is_valid(params.scheduler)) {
+                            cutlass::arch::launch_dependent_grids();
+                        }
+                    }
+                    continue;
+                }
                 SeqlenInfo_t seqlen_info{
                     bidb,
                     get<0>(params.mainloop.shape_Q),

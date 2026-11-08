@@ -442,6 +442,9 @@ class FlashAttentionForwardSm100:
         mBlocksToBatchIdx: Optional[cute.Tensor] = None,
         max_seqlen_q: Int32 | int | None = None,
         tensormap_workspace: Optional[cute.Tensor] = None,  # (num_ctas, 16) Int64, one TMA descriptor per CTA
+        mHeadTpRowKind: Optional[cute.Tensor] = None,
+        mHeadTpQRange: Optional[cute.Tensor] = None,
+        head_tp_dp_size: Int32 = Int32(0),
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -719,6 +722,9 @@ class FlashAttentionForwardSm100:
             cu_total_splits_m_blocks_ptr=mCuTotalSplitsMBlocks,
             blocks_to_batch_idx_ptr=mBlocksToBatchIdx,
             tile_count_semaphore=tile_count_semaphore.iterator if tile_count_semaphore is not None else None,
+            head_tp_row_kind=mHeadTpRowKind,
+            head_tp_q_range=mHeadTpQRange,
+            head_tp_dp_size=head_tp_dp_size,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(
             tile_sched_args, scheduling_mode=self.scheduling_mode

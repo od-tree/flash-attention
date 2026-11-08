@@ -595,6 +595,9 @@ def _flash_attn_fwd(
     seqlen_k_per_split: Optional[int] = None,
     disable_scheduler_metadata: bool = False,
     gather_bwd_recompute_p: bool = False,
+    head_tp_row_kind: Optional[torch.Tensor] = None,
+    head_tp_q_range: Optional[torch.Tensor] = None,
+    head_tp_dp_size: int = 0,
     *,
     config: FwdConfig | MlaFwdConfig | None = None,
 ) -> Tuple[
@@ -627,6 +630,9 @@ def _flash_attn_fwd(
             else a FwdConfig.
     """
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
+    if head_tp_row_kind is not None:
+        head_tp_row_kind = head_tp_row_kind.to(torch.int32).contiguous()
+        head_tp_q_range = head_tp_q_range.to(torch.int32).contiguous().view(-1)
     requires_grad = any(
         t is not None and t.requires_grad for t in (q, k, v, qv, learnable_sink)
     )
@@ -1421,6 +1427,8 @@ def _flash_attn_fwd(
         out_torch_dtype,
         # the decode kernel is a different class with a different grid and smem plan
         decode_splits,
+        head_tp_row_kind is not None,
+        head_tp_dp_size,
     )
 
     if _needs_compile(_flash_attn_fwd.compile_cache, compile_key):
@@ -1806,6 +1814,15 @@ def _flash_attn_fwd(
                 ])
                 if arch // 10 == 9:
                     compile_args.append(tensormap_workspace_tensor)
+            compile_args.extend([
+                to_cute_tensor(head_tp_row_kind, assumed_align=4, leading_dim=0)
+                if head_tp_row_kind is not None
+                else None,
+                to_cute_tensor(head_tp_q_range, assumed_align=4, leading_dim=0)
+                if head_tp_q_range is not None
+                else None,
+                head_tp_dp_size,
+            ])
             compile_args.append(current_stream)
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(*compile_args, options="--enable-tvm-ffi")
 
@@ -1936,6 +1953,7 @@ def _flash_attn_fwd(
                 ])
                 if arch // 10 == 9:
                     call_args.append(tensormap_workspace)
+            call_args.extend([head_tp_row_kind, head_tp_q_range, head_tp_dp_size])
             _flash_attn_fwd.compile_cache[compile_key](*call_args)
     if use_sparse_decode and is_split_kv:
         # decode partials are per token row: one batch of length total_q, no cu_seqlens
@@ -3765,6 +3783,9 @@ class FlashAttnFunc(torch.autograd.Function):
         output_scale: Optional[torch.Tensor] = None,
         gather_bwd_recompute_p: bool = False,
         gather_bwd_token_chunk: Optional[int] = None,
+        head_tp_row_kind: Optional[torch.Tensor] = None,
+        head_tp_q_range: Optional[torch.Tensor] = None,
+        head_tp_dp_size: int = 0,
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
@@ -3798,6 +3819,9 @@ class FlashAttnFunc(torch.autograd.Function):
             out=out,
             output_scale=output_scale,
             gather_bwd_recompute_p=gather_bwd_recompute_p,
+            head_tp_row_kind=head_tp_row_kind,
+            head_tp_q_range=head_tp_q_range,
+            head_tp_dp_size=head_tp_dp_size,
         )
         ctx.save_for_backward(q, k, v, qv, out, lse, p, row_max, o_lo, gather_kv_indices, learnable_sink, *(aux_tensors or ()))
         ctx.gather_bwd_recompute_p = gather_bwd_recompute_p
@@ -3919,6 +3943,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         disable_scheduler_metadata: bool = False,
         gather_bwd_recompute_p: bool = False,
         gather_bwd_token_chunk: Optional[int] = None,
+        head_tp_row_kind: Optional[torch.Tensor] = None,
+        head_tp_q_range: Optional[torch.Tensor] = None,
+        head_tp_dp_size: int = 0,
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
@@ -3963,6 +3990,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             seqlen_k_per_split=seqlen_k_per_split,
             disable_scheduler_metadata=disable_scheduler_metadata,
             gather_bwd_recompute_p=gather_bwd_recompute_p,
+            head_tp_row_kind=head_tp_row_kind,
+            head_tp_q_range=head_tp_q_range,
+            head_tp_dp_size=head_tp_dp_size,
         )
         ctx.save_for_backward(
             q,
@@ -4139,6 +4169,9 @@ def flash_attn_func(
     gather_kv_valid_length: Optional[torch.Tensor] = None,
     gather_bwd_recompute_p: bool = False,
     gather_bwd_token_chunk: Optional[int] = None,
+    head_tp_row_kind: Optional[torch.Tensor] = None,
+    head_tp_q_range: Optional[torch.Tensor] = None,
+    head_tp_dp_size: int = 0,
 ):
     gather_bwd_token_chunk = _validate_gather_bwd_kwargs(
         gather_kv_indices, gather_bwd_recompute_p, gather_bwd_token_chunk
@@ -4184,6 +4217,9 @@ def flash_attn_func(
         output_scale,
         gather_bwd_recompute_p,
         gather_bwd_token_chunk,
+        head_tp_row_kind,
+        head_tp_q_range,
+        head_tp_dp_size,
     )
 
 
@@ -4224,6 +4260,9 @@ def flash_attn_varlen_func(
     gather_kv_valid_length: Optional[torch.Tensor] = None,
     gather_bwd_recompute_p: bool = False,
     gather_bwd_token_chunk: Optional[int] = None,
+    head_tp_row_kind: Optional[torch.Tensor] = None,
+    head_tp_q_range: Optional[torch.Tensor] = None,
+    head_tp_dp_size: int = 0,
 ):
     """
     Tensor arguments:
@@ -4332,6 +4371,9 @@ def flash_attn_varlen_func(
         disable_scheduler_metadata,
         gather_bwd_recompute_p,
         gather_bwd_token_chunk,
+        head_tp_row_kind,
+        head_tp_q_range,
+        head_tp_dp_size,
     )
 
 
