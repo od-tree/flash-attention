@@ -144,6 +144,14 @@ struct Flash_fwd_params : public Qkv_params {
 
     bool unpadded_lse;  // For varlen paths: LSE is in [nheads, total_seqlen_q] format instead of [b, nheads, seqlen_q].
     bool seqlenq_ngroups_swapped;  // q has been transposed from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d).
+
+    // Head-TP tile predicate. Null keeps the existing full-head path.
+    // row_kind is indexed by batch (one decode token per batch row):
+    //   0 local, 1 owner shard, 2 empty padding.
+    // q_range is [batch, dp_size, 2]; shard 0 is the head interval this rank computes.
+    int8_t *__restrict__ head_tp_row_kind = nullptr;
+    int *__restrict__ head_tp_q_range = nullptr;
+    int head_tp_dp_size = 0;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

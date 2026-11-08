@@ -23,6 +23,7 @@
 #include "mask.h"
 #include "dropout.h"
 #include "rotary.h"
+#include "head_tp_skip.h"
 
 namespace FLASH_NAMESPACE {
 
@@ -86,6 +87,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     const BlockInfo</*Varlen=*/!Is_even_MN> binfo(params, bidb);
     if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
+    if (!head_tp_tile_active(params, bidb, bidh)) return;
 
     const int n_block_min = !Is_local ? 0 : std::max(0, (m_block * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q - params.window_size_left) / kBlockN);
     int n_block_max = cute::ceil_div(binfo.actual_seqlen_k, kBlockN);
@@ -531,6 +533,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     // if (threadIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) { printf("Is_even_MN = %d, is_cumulativ = %d, seqlen_k_cache = %d, actual_seqlen_k = %d\n", Is_even_MN, params.is_seqlens_k_cumulative, binfo.seqlen_k_cache, binfo.actual_seqlen_k); }
     // if (threadIdx.x == 0 && blockIdx.y == 1 && blockIdx.z == 0) { printf("params.knew_ptr = %p, seqlen_k_cache + seqlen_knew = %d\n", params.knew_ptr, binfo.seqlen_k_cache + (params.knew_ptr == nullptr ? 0 : params.seqlen_knew)); }
     if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
+    if (!head_tp_tile_active(params, bidb, bidh)) return;
 
     const int n_blocks_per_split = ((binfo.actual_seqlen_k + kBlockN - 1) / kBlockN + num_n_splits - 1) / num_n_splits;
     const int n_block_min = !Is_local
