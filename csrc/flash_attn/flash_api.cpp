@@ -373,6 +373,37 @@ std::tuple<Tensor, Tensor> set_params_splitkv(Flash_fwd_params &params, const in
     return std::make_tuple(softmax_lse_accum, out_accum);
 }
 
+// Copied after set_params_fprop, which value-initializes the struct.
+// A null row_kind leaves every tile active.
+void set_params_head_tp(Flash_fwd_params &params,
+                        const std::optional<Tensor> &row_kind,
+                        const std::optional<Tensor> &q_range,
+                        int64_t dp_size,
+                        int batch_size) {
+    params.head_tp_row_kind = nullptr;
+    params.head_tp_q_range = nullptr;
+    params.head_tp_dp_size = 0;
+    if (!row_kind.has_value()) {
+        STD_TORCH_CHECK(!q_range.has_value(), "head_tp_q_range requires head_tp_row_kind");
+        return;
+    }
+    STD_TORCH_CHECK(q_range.has_value(), "head_tp_q_range is required when head_tp_row_kind is set");
+    STD_TORCH_CHECK(dp_size > 0, "head_tp_dp_size must be positive");
+    const Tensor &row = row_kind.value();
+    const Tensor &range = q_range.value();
+    STD_TORCH_CHECK(row.scalar_type() == ScalarType::Char, "head_tp_row_kind must be int8");
+    STD_TORCH_CHECK(range.scalar_type() == ScalarType::Int, "head_tp_q_range must be int32");
+    CHECK_DEVICE(row);
+    CHECK_DEVICE(range);
+    CHECK_CONTIGUOUS(row);
+    CHECK_CONTIGUOUS(range);
+    CHECK_SHAPE(row, batch_size);
+    CHECK_SHAPE(range, batch_size, static_cast<int>(dp_size), 2);
+    params.head_tp_row_kind = static_cast<int8_t *>(row.data_ptr());
+    params.head_tp_q_range = static_cast<int *>(range.data_ptr());
+    params.head_tp_dp_size = static_cast<int>(dp_size);
+}
+
 void set_params_alibi(Flash_fwd_params &params, std::optional<Tensor> &alibi_slopes_, int batch_size, int num_heads){
 #ifdef FLASHATTENTION_DISABLE_ALIBI
     STD_TORCH_CHECK(!alibi_slopes_.has_value(), "This flash attention build does not support alibi.");
@@ -583,7 +614,10 @@ mha_varlen_fwd(Tensor q,  // total_q x num_heads x head_size, total_q := \sum_{i
                const bool return_softmax,
                int64_t num_splits,
                // Retained only for backwards-compat arg positioning; must be None.
-               std::optional<Tensor> unused_generator_compat) {
+               std::optional<Tensor> unused_generator_compat,
+               std::optional<Tensor> head_tp_row_kind,
+               std::optional<Tensor> head_tp_q_range,
+               int64_t head_tp_dp_size) {
 
     STD_TORCH_CHECK(!unused_generator_compat.has_value(),
                     "flash-attn: the RNG `generator` argument is no longer supported and must be None; "
@@ -793,6 +827,7 @@ mha_varlen_fwd(Tensor q,  // total_q x num_heads x head_size, total_q := \sum_{i
     // }
 
     set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
+    set_params_head_tp(params, head_tp_row_kind, head_tp_q_range, head_tp_dp_size, batch_size);
 
     if (max_seqlen_k > 0) {
         auto stream = get_current_cuda_stream(q);
@@ -1326,7 +1361,10 @@ mha_fwd_kvcache(Tensor q,                 // batch_size x seqlen_q x num_heads x
                 int64_t window_size_right,
                 const double softcap,
                 bool is_rotary_interleaved,   // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
-                int64_t num_splits
+                int64_t num_splits,
+                std::optional<Tensor> head_tp_row_kind,
+                std::optional<Tensor> head_tp_q_range,
+                int64_t head_tp_dp_size
                 ) {
 
     // Otherwise the kernel will be launched from cuda:0 device
@@ -1583,6 +1621,7 @@ mha_fwd_kvcache(Tensor q,                 // batch_size x seqlen_q x num_heads x
 
 
     set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
+    set_params_head_tp(params, head_tp_row_kind, head_tp_q_range, head_tp_dp_size, batch_size);
 
     auto stream = get_current_cuda_stream(q);
     // Only split kernel supports appending to KV cache, or indexing to the cache with cache_batch_idx,

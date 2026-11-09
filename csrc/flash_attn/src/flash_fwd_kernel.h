@@ -1296,6 +1296,9 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
         if (idx < params.b * params.h * params.seqlen_q) {
             const int batch_idx = idx / (params.h * params.seqlen_q);
             const int head_idx = (idx - batch_idx * (params.h * params.seqlen_q)) / params.seqlen_q;
+            // The partial kernel already returned before writing this tile.
+            // Skip the store so a pre-zeroed output stays zero.
+            if (!head_tp_tile_active(params, batch_idx, head_idx)) { continue; }
             // The index to the rows of Q
             const int row = idx - batch_idx * (params.h * params.seqlen_q) - head_idx * params.seqlen_q;
             auto o_ptr = reinterpret_cast<Element *>(params.o_ptr) + batch_idx * params.o_batch_stride

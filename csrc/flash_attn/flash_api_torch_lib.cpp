@@ -41,7 +41,10 @@ mha_varlen_fwd(Tensor q,  // total_q x num_heads x head_size, total_q := \sum_{i
                const bool return_softmax,
                int64_t num_splits,
                // Retained only for backwards-compat arg positioning; must be None.
-               std::optional<Tensor> unused_generator_compat);
+               std::optional<Tensor> unused_generator_compat,
+               std::optional<Tensor> head_tp_row_kind,
+               std::optional<Tensor> head_tp_q_range,
+               int64_t head_tp_dp_size);
 
 std::vector<Tensor>
 mha_fwd_kvcache(Tensor q,                 // batch_size x seqlen_q x num_heads x head_size
@@ -63,7 +66,10 @@ mha_fwd_kvcache(Tensor q,                 // batch_size x seqlen_q x num_heads x
                 int64_t window_size_right,
                 const double softcap,
                 bool is_rotary_interleaved,   // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
-                int64_t num_splits);
+                int64_t num_splits,
+                std::optional<Tensor> head_tp_row_kind,
+                std::optional<Tensor> head_tp_q_range,
+                int64_t head_tp_dp_size);
 
 /////////////////////////// From flash_api_sparse.cpp //////////////////////////
 
@@ -119,12 +125,14 @@ STABLE_TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
             "Tensor cu_seqlens_k, Tensor? seqused_k, Tensor? leftpad_k, Tensor? block_table, Tensor? alibi_slopes, "
             "int max_seqlen_q, int max_seqlen_k, float p_dropout, float softmax_scale, bool zero_tensors, "
             "bool is_causal, int window_size_left, int window_size_right, float softcap, bool return_softmax, "
-            "int num_splits, Tensor? gen) -> Tensor[]");
+            "int num_splits, Tensor? gen, Tensor? head_tp_row_kind=None, Tensor? head_tp_q_range=None, "
+            "int head_tp_dp_size=0) -> Tensor[]");
 
     ops.def("fwd_kvcache(Tensor! q, Tensor kcache, Tensor vcache, Tensor? k, Tensor? v, Tensor? seqlens_k, "
             "Tensor? rotary_cos, Tensor? rotary_sin, Tensor? cache_batch_idx, Tensor? leftpad_k, Tensor? block_table, "
             "Tensor? alibi_slopes, Tensor!? out, float softmax_scale, bool is_causal, int window_size_left, "
-            "int window_size_right, float softcap, bool is_rotary_interleaved, int num_splits) -> Tensor[]");
+            "int window_size_right, float softcap, bool is_rotary_interleaved, int num_splits, "
+            "Tensor? head_tp_row_kind=None, Tensor? head_tp_q_range=None, int head_tp_dp_size=0) -> Tensor[]");
 
     ops.def("fwd_sparse(Tensor! q, Tensor k, Tensor v, "
             "Tensor block_count, Tensor block_offset, Tensor column_count, Tensor column_index, "
