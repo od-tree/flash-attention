@@ -8,8 +8,10 @@
 # FA4 block-sparsity prepass omits them before the mainloop starts.
 #
 # Payload exchange, arrival flags, and the splice are not part of that prune.
-# run_head_tp performs them in the fixed order from the head-TP spec. History
-# KV is already caught up; this function only appends the current token.
+# run_head_tp performs them in the fixed order from the head-TP spec. The GPU
+# copies and the device-side spin are head_tp_exchange.cu; the functions below
+# are the same index rules on one process. History KV is already caught up;
+# send_current only copies the current token.
 
 from dataclasses import dataclass, field
 
@@ -104,9 +106,63 @@ def _write_kv(cache_k, cache_v, token, seq_len, k_now, v_now, kv_begin, kv_end):
     cache_v[token, pos, kv_begin:kv_end] = v_now[kv_begin:kv_end]
 
 
+def send_current(world: World):
+    """Write remote Q and current K/V, then set the request flag. No waiting.
+
+    Empty and local rows do not touch payload or arrived. The request flag is
+    arrived[peer, src, token]. The return flag uses the swapped rank index.
+    """
+    dp = len(world.ranks)
+    for rank in world.ranks:
+        for token in range(rank.q.shape[0]):
+            if int(rank.row_kind[token]) != ROW_OWNER:
+                continue
+            for slot in range(1, dp):
+                peer = int(rank.slot_rank[token, slot])
+                if peer < 0 or peer == rank.rank:
+                    continue
+                qb = int(rank.q_range[token, slot, 0])
+                qe = int(rank.q_range[token, slot, 1])
+                kb = int(rank.kv_range[token, slot, 0])
+                ke = int(rank.kv_range[token, slot, 1])
+                world.payload_q[peer, rank.rank, token, : qe - qb] = rank.q[token, qb:qe]
+                world.payload_k[peer, rank.rank, token, : ke - kb] = rank.k[token, kb:ke]
+                world.payload_v[peer, rank.rank, token, : ke - kb] = rank.v[token, kb:ke]
+                world.arrived[peer, rank.rank, token] = 1
+
+
+def wait_arrived(arrived: torch.Tensor, expect: int):
+    """CPU stand-in for head_tp_wait. expect <= 0 returns without reading."""
+    expect = int(expect)
+    if expect <= 0:
+        return
+    got = int((arrived == 1).sum())
+    if got < expect:
+        raise RuntimeError(f"expected {expect} arrival flags, saw {got}")
+
+
+def remote_shard_count(rank: Rank) -> int:
+    """How many return flags this owner rank waits for."""
+    dp = rank.slot_rank.shape[1]
+    count = 0
+    for token in range(rank.row_kind.shape[0]):
+        if int(rank.row_kind[token]) != ROW_OWNER:
+            continue
+        for slot in range(1, dp):
+            if int(rank.slot_rank[token, slot]) >= 0:
+                count += 1
+    return count
+
+
+def publish_return(world: World, owner: int, partner: int, token: int, partial: torch.Tensor):
+    """Write one partial into the owner's payload_out and set the return flag."""
+    q_len = partial.shape[0]
+    world.payload_out[owner, partner, token, :q_len] = partial
+    world.arrived[owner, partner, token] = 1
+
+
 def phase_local_and_send(world: World):
     """Local rows, owner shard, then payload stores. No waiting."""
-    dp = len(world.ranks)
     for rank in world.ranks:
         hkv = rank.k.shape[1]
         for token in range(rank.q.shape[0]):
@@ -138,18 +194,7 @@ def phase_local_and_send(world: World):
                 rank.v_cache[token, :seq_len, kv_begin:kv_end],
                 world.scale,
             )
-            for slot in range(1, dp):
-                peer = int(rank.slot_rank[token, slot])
-                if peer < 0:
-                    continue
-                qb = int(rank.q_range[token, slot, 0])
-                qe = int(rank.q_range[token, slot, 1])
-                kb = int(rank.kv_range[token, slot, 0])
-                ke = int(rank.kv_range[token, slot, 1])
-                world.payload_q[peer, rank.rank, token, : qe - qb] = rank.q[token, qb:qe]
-                world.payload_k[peer, rank.rank, token, : ke - kb] = rank.k[token, kb:ke]
-                world.payload_v[peer, rank.rank, token, : ke - kb] = rank.v[token, kb:ke]
-                world.arrived[peer, rank.rank, token] = 1
+    send_current(world)
 
 
 def phase_partner(world: World):
@@ -159,11 +204,9 @@ def phase_partner(world: World):
     """
     dp = len(world.ranks)
     for rank in world.ranks:
+        wait_arrived(world.arrived[rank.rank], int(rank.inbound.sum()))
         if int(rank.inbound.sum()) == 0:
             continue
-        got = int((world.arrived[rank.rank] == 1).sum())
-        if got != int(rank.inbound.sum()):
-            raise RuntimeError(f"rank {rank.rank} expected {int(rank.inbound.sum())} shards, saw {got}")
         for src in range(dp):
             if src == rank.rank:
                 continue
@@ -193,13 +236,13 @@ def phase_partner(world: World):
                     peer_v[:seq_len],
                     world.scale,
                 )
-                world.payload_out[src, rank.rank, token, : qe - qb] = partial
-                world.arrived[src, rank.rank, token] = 1
+                publish_return(world, src, rank.rank, token, partial)
 
 
 def phase_splice(world: World):
     dp = len(world.ranks)
     for rank in world.ranks:
+        wait_arrived(world.arrived[rank.rank], remote_shard_count(rank))
         for token in range(rank.q.shape[0]):
             if int(rank.row_kind[token]) != ROW_OWNER:
                 continue

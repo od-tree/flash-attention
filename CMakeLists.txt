@@ -145,7 +145,10 @@ if (FA2_ENABLED)
     file(GLOB FA2_GEN_SRCS "csrc/flash_attn/src/flash_fwd_*.cu")
 
     # For CUDA we set the architectures on a per file basis
+    set(FA2_HEAD_TP_API "")
     if (VLLM_GPU_LANG STREQUAL "CUDA")
+        list(APPEND FA2_GEN_SRCS csrc/flash_attn/src/head_tp_exchange.cu)
+        set(FA2_HEAD_TP_API csrc/flash_attn/src/head_tp_exchange_api.cpp)
         cuda_archs_loose_intersection(FA2_ARCHS "8.0+PTX" "${CUDA_ARCHS}")
         message(STATUS "FA2_ARCHS: ${FA2_ARCHS}")
 
@@ -162,6 +165,7 @@ if (FA2_ENABLED)
             csrc/flash_attn/flash_api.cpp
             csrc/flash_attn/flash_api_sparse.cpp
             csrc/flash_attn/flash_api_torch_lib.cpp
+            ${FA2_HEAD_TP_API}
             ${FA2_GEN_SRCS}
         COMPILE_FLAGS ${VLLM_FA_GPU_FLAGS}
         USE_SABI 3
@@ -273,7 +277,10 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
 
     # For CUDA we set the architectures on a per file basis
     # FaV3 is not yet supported in Blackwell
+    set(FA3_HEAD_TP_API "")
     if (VLLM_GPU_LANG STREQUAL "CUDA")
+        list(APPEND FA3_GEN_SRCS csrc/flash_attn/src/head_tp_exchange.cu)
+        set(FA3_HEAD_TP_API csrc/flash_attn/src/head_tp_exchange_api.cpp)
         cuda_archs_loose_intersection(FA3_ARCHS "9.0a;" "${CUDA_ARCHS}")
         message(STATUS "FA3_ARCHS: ${FA3_ARCHS}")
 
@@ -296,6 +303,7 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
             hopper/flash_prepare_scheduler.cu
             hopper/flash_api.cpp
             hopper/flash_api_torch_lib.cpp
+            ${FA3_HEAD_TP_API}
             ${FA3_GEN_SRCS}
         COMPILE_FLAGS ${VLLM_FA_GPU_FLAGS}
         ARCHITECTURES "" # LucasW: this is ignored for cuda and set on a per-file basis

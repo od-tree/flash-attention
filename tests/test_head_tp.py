@@ -19,8 +19,12 @@ Rank = _head_tp.Rank
 World = _head_tp.World
 attend = _head_tp.attend
 head_tp_mask_mod = _head_tp.head_tp_mask_mod
+publish_return = _head_tp.publish_return
+remote_shard_count = _head_tp.remote_shard_count
 run_head_tp = _head_tp.run_head_tp
+send_current = _head_tp.send_current
 tile_active = _head_tp.tile_active
+wait_arrived = _head_tp.wait_arrived
 
 
 def _full_out(q, k_now, v_now, history_k, history_v, seq_len, scale):
@@ -140,6 +144,48 @@ def test_tile_predicate_matches_fa4_full_mask():
         assert mask_mod(batch, head, 0, 5, None) is active
 
 
+def test_send_and_return_use_different_flags():
+    torch.manual_seed(0)
+    tokens, num_q, num_kv, dim, seq = 3, 8, 2, 16, 5
+    degree = 2
+    q = torch.randn(tokens, num_q, dim)
+    k = torch.randn(tokens, num_kv, dim)
+    v = torch.randn(tokens, num_kv, dim)
+    history_k = torch.randn(tokens, seq, num_kv, dim)
+    history_v = torch.randn(tokens, seq, num_kv, dim)
+    seq_len = torch.tensor([seq, seq, seq], dtype=torch.int32)
+    row_kind = torch.tensor([ROW_LOCAL, ROW_OWNER, ROW_EMPTY], dtype=torch.int8)
+    slot_rank, q_range, kv_range = _ranges(num_q, num_kv, degree, tokens, owners=[-1, 0, -1])
+    world, _scale = _world(
+        q, k, v, history_k, history_v, seq_len, row_kind, slot_rank, q_range, kv_range, degree
+    )
+    send_current(world)
+    token, peer = 1, 1
+    qb, qe = (int(q_range[token, peer, 0]), int(q_range[token, peer, 1]))
+    kb, ke = (int(kv_range[token, peer, 0]), int(kv_range[token, peer, 1]))
+    torch.testing.assert_close(world.payload_q[peer, 0, token, : qe - qb], q[token, qb:qe])
+    torch.testing.assert_close(world.payload_k[peer, 0, token, : ke - kb], k[token, kb:ke])
+    torch.testing.assert_close(world.payload_v[peer, 0, token, : ke - kb], v[token, kb:ke])
+    assert int(world.arrived[peer, 0, token]) == 1
+    assert int(world.arrived[0, peer, token]) == 0
+    assert int(world.arrived[:, :, 0].sum()) == 0
+    assert int(world.arrived[:, :, 2].sum()) == 0
+    wait_arrived(world.arrived[0], 0)
+    wait_arrived(world.arrived[peer], int(world.ranks[peer].inbound.sum()))
+    try:
+        wait_arrived(world.arrived[peer], 2)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("a short arrival count must fail")
+    partial = torch.ones(qe - qb, dim)
+    publish_return(world, 0, peer, token, partial)
+    assert int(world.arrived[peer, 0, token]) == 1
+    assert int(world.arrived[0, peer, token]) == 1
+    torch.testing.assert_close(world.payload_out[0, peer, token, : qe - qb], partial)
+    wait_arrived(world.arrived[0], remote_shard_count(world.ranks[0]))
+
+
 def test_local_and_d2_match_full_attention():
     torch.manual_seed(0)
     tokens, num_q, num_kv, dim, seq = 3, 8, 2, 16, 5
@@ -196,6 +242,7 @@ def test_d4_one_row_matches_full_attention():
 
 if __name__ == "__main__":
     test_tile_predicate_matches_fa4_full_mask()
+    test_send_and_return_use_different_flags()
     test_local_and_d2_match_full_attention()
     test_d4_one_row_matches_full_attention()
     print("ok")
