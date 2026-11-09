@@ -1,5 +1,7 @@
 #include "head_tp_exchange.h"
 
+#include <cstdio>
+
 namespace {
 
 constexpr uint64_t kSpinLimit = 100000000;
