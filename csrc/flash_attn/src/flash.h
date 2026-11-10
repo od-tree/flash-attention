@@ -152,6 +152,10 @@ struct Flash_fwd_params : public Qkv_params {
     int8_t *__restrict__ head_tp_row_kind = nullptr;
     int *__restrict__ head_tp_q_range = nullptr;
     int head_tp_dp_size = 0;
+    // 1 keeps the tile head as a Q head. Decode GQA sets this to the group
+    // size: fwd_kvcache swaps the layout without seqlenq_ngroups_swapped,
+    // because that flag also rescales the batch stride.
+    int head_tp_q_per_kv = 1;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

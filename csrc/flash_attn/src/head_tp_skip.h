@@ -32,5 +32,11 @@ __device__ __forceinline__ bool head_tp_tile_active(const Params &params, int ba
     const int base = (batch * params.head_tp_dp_size) * 2;
     const int q_begin = params.head_tp_q_range[base];
     const int q_end = params.head_tp_q_range[base + 1];
-    return head >= q_begin && head < q_end;
+    // Decode GQA rewrites Q to [batch, groups, kv, dim], so `head` is the KV
+    // head and owns Q [head * groups, (head + 1) * groups). group == 1 is the
+    // direct Q-head comparison.
+    const int group = params.head_tp_q_per_kv > 1 ? params.head_tp_q_per_kv : 1;
+    const int owned_begin = head * group;
+    const int owned_end = owned_begin + group;
+    return owned_begin < q_end && owned_end > q_begin;
 }

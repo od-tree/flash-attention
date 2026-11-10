@@ -286,6 +286,21 @@ void set_params_dgrad(Flash_bwd_params &params,
 }
 
 void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split_kernel=false) {
+#ifdef FA2_MINIMAL_HDIM256_FP16
+    // The tile-skip test only launches fp16 head dim 256. The runtime
+    // switches below would still reference every other instantiation.
+    STD_TORCH_CHECK(!params.is_bf16, "This build only supports fp16.");
+    STD_TORCH_CHECK(params.d == 256, "This build only supports head dimension 256.");
+    using elem_type = cutlass::half_t;
+    constexpr int kHeadDim = 256;
+    BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+        if (params.num_splits <= 1 && !force_split_kernel) {
+            run_mha_fwd_<elem_type, kHeadDim, Is_causal>(params, stream);
+        } else {
+            run_mha_fwd_splitkv_dispatch<elem_type, kHeadDim, Is_causal>(params, stream);
+        }
+    });
+#else
     FP16_SWITCH(!params.is_bf16, [&] {
         HEADDIM_SWITCH(params.d, [&] {
             BOOL_SWITCH(params.is_causal, Is_causal, [&] {
@@ -297,6 +312,7 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
             });
         });
     });
+#endif
 }
 
 // Find the number of splits that maximizes the occupancy. For example, if we have
@@ -402,6 +418,12 @@ void set_params_head_tp(Flash_fwd_params &params,
     params.head_tp_row_kind = static_cast<int8_t *>(row.data_ptr());
     params.head_tp_q_range = static_cast<int *>(range.data_ptr());
     params.head_tp_dp_size = static_cast<int>(dp_size);
+}
+
+// Call after set_params_fprop. The swap rewrites seqlen_q to the Q group size
+// on both varlen and kvcache; only varlen also sets seqlenq_ngroups_swapped.
+void set_head_tp_q_per_kv(Flash_fwd_params &params, bool swapped) {
+    params.head_tp_q_per_kv = swapped ? static_cast<int>(params.seqlen_q) : 1;
 }
 
 void set_params_alibi(Flash_fwd_params &params, std::optional<Tensor> &alibi_slopes_, int batch_size, int num_heads){
@@ -547,6 +569,7 @@ mha_fwd(Tensor q,         // batch_size x seqlen_q x num_heads x round_multiple(
                      window_size_right,
                      softcap
                      );
+    set_head_tp_q_per_kv(params, seqlenq_ngroups_swapped);
 
     // Keep references to these tensors to extend their lifetime
     Tensor softmax_lse_accum, out_accum;
@@ -778,6 +801,7 @@ mha_varlen_fwd(Tensor q,  // total_q x num_heads x head_size, total_q := \sum_{i
                      seqlenq_ngroups_swapped,
                      /*unpadded_lse*/true);
     params.total_q = total_q;
+    set_head_tp_q_per_kv(params, seqlenq_ngroups_swapped);
 
     if (paged_KV) {
         params.block_table = block_table.mutable_data_ptr<int>();
@@ -1497,6 +1521,7 @@ mha_fwd_kvcache(Tensor q,                 // batch_size x seqlen_q x num_heads x
                      window_size_right,
                      softcap
                      );
+    set_head_tp_q_per_kv(params, seqlenq_ngroups_swapped);
 
     Tensor k, v, k_padded, v_padded;
     if (k_.has_value()) {

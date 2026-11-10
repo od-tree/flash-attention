@@ -141,13 +141,34 @@ string(REPLACE "-O2" "-O3" CMAKE_CUDA_FLAGS_RELWITHDEBINFO "${CMAKE_CUDA_FLAGS_R
 # _C extension
 #
 
+option(FA2_MINIMAL_HDIM256_FP16 "Compile only the fp16 head-dim 256 FA2 kernels" OFF)
+
 if (FA2_ENABLED)
-    file(GLOB FA2_GEN_SRCS "csrc/flash_attn/src/flash_fwd_*.cu")
+    if (FA2_MINIMAL_HDIM256_FP16)
+        # The tile-skip test uses fp16, head dim 256, both the regular kernel
+        # and split-KV. Causal and num_splits==1 are still referenced by the
+        # runtime switches, so those six files are the whole set.
+        set(FA2_GEN_SRCS
+            csrc/flash_attn/src/flash_fwd_hdim256_fp16_sm80.cu
+            csrc/flash_attn/src/flash_fwd_hdim256_fp16_causal_sm80.cu
+            csrc/flash_attn/src/flash_fwd_split_hdim256_fp16_sm80.cu
+            csrc/flash_attn/src/flash_fwd_split_hdim256_fp16_causal_sm80.cu
+            csrc/flash_attn/src/flash_fwd_split_align_hdim256_fp16_sm80.cu
+            csrc/flash_attn/src/flash_fwd_split_align_hdim256_fp16_causal_sm80.cu)
+        set(FA2_SPARSE_API "")
+        # The dual-GPU step also sends the current token. One small file.
+        list(APPEND FA2_GEN_SRCS csrc/flash_attn/src/head_tp_exchange.cu)
+    else()
+        file(GLOB FA2_GEN_SRCS "csrc/flash_attn/src/flash_fwd_*.cu")
+        set(FA2_SPARSE_API csrc/flash_attn/flash_api_sparse.cpp)
+    endif()
 
     # For CUDA we set the architectures on a per file basis
     set(FA2_HEAD_TP_API "")
     if (VLLM_GPU_LANG STREQUAL "CUDA")
-        list(APPEND FA2_GEN_SRCS csrc/flash_attn/src/head_tp_exchange.cu)
+        if (NOT FA2_MINIMAL_HDIM256_FP16)
+            list(APPEND FA2_GEN_SRCS csrc/flash_attn/src/head_tp_exchange.cu)
+        endif()
         set(FA2_HEAD_TP_API csrc/flash_attn/src/head_tp_exchange_api.cpp)
         cuda_archs_loose_intersection(FA2_ARCHS "8.0+PTX" "${CUDA_ARCHS}")
         message(STATUS "FA2_ARCHS: ${FA2_ARCHS}")
@@ -163,7 +184,7 @@ if (FA2_ENABLED)
         LANGUAGE ${VLLM_GPU_LANG}
         SOURCES
             csrc/flash_attn/flash_api.cpp
-            csrc/flash_attn/flash_api_sparse.cpp
+            ${FA2_SPARSE_API}
             csrc/flash_attn/flash_api_torch_lib.cpp
             ${FA2_HEAD_TP_API}
             ${FA2_GEN_SRCS}
@@ -190,6 +211,7 @@ if (FA2_ENABLED)
         USE_CUDA
         # TORCH_TARGET_VERSION pins torch 2.10+ and bans unstable usage
         TORCH_TARGET_VERSION=0x020A000000000000ULL
+        $<$<BOOL:${FA2_MINIMAL_HDIM256_FP16}>:FA2_MINIMAL_HDIM256_FP16=1>
     )
 
     # Pin the C++ standard on the target itself. When flash-attn is built as a

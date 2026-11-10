@@ -176,6 +176,9 @@ class cmake_build_ext(build_ext):
         # on subsequent calls to python.
         cmake_args += ['-DVLLM_PYTHON_PATH={}'.format(":".join(sys.path))]
 
+        if os.getenv("FA2_MINIMAL_HDIM256_FP16") == "1":
+            cmake_args += ['-DFA2_MINIMAL_HDIM256_FP16=ON']
+
         #
         # Setup parallelism and build tool
         #

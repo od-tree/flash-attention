@@ -134,6 +134,7 @@ STABLE_TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
             "int window_size_right, float softcap, bool is_rotary_interleaved, int num_splits, "
             "Tensor? head_tp_row_kind=None, Tensor? head_tp_q_range=None, int head_tp_dp_size=0) -> Tensor[]");
 
+#ifndef FA2_MINIMAL_HDIM256_FP16
     ops.def("fwd_sparse(Tensor! q, Tensor k, Tensor v, "
             "Tensor block_count, Tensor block_offset, Tensor column_count, Tensor column_index, "
             "Tensor!? out, Tensor? alibi_slopes, "
@@ -147,13 +148,16 @@ STABLE_TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
             "Tensor cu_seqlens_k, Tensor? seqused_k, Tensor? alibi_slopes, "
             "int max_seqlen_q, int max_seqlen_k, float p_dropout, float softmax_scale, bool zero_tensors, "
             "bool is_causal, float softcap, bool return_softmax, Tensor? gen) -> Tensor[]");
+#endif
 }
 
 STABLE_TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, CUDA, ops) {
     ops.impl("varlen_fwd", TORCH_BOX(&FLASH_NAMESPACE::mha_varlen_fwd));
     ops.impl("fwd_kvcache", TORCH_BOX(&FLASH_NAMESPACE::mha_fwd_kvcache));
+#ifndef FA2_MINIMAL_HDIM256_FP16
     ops.impl("fwd_sparse", TORCH_BOX(&FLASH_NAMESPACE::mha_fwd_sparse));
     ops.impl("varlen_fwd_sparse", TORCH_BOX(&FLASH_NAMESPACE::mha_varlen_fwd_sparse));
+#endif
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

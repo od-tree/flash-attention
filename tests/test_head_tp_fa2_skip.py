@@ -1,8 +1,10 @@
 """FA2 head-TP tile skip through varlen_fwd and fwd_kvcache.
 
-Q heads and KV heads are equal, so the decode GQA transpose does not run.
-That transpose would make the kernel head index a KV head. The predicate
-indexes Q heads.
+The equal-head case keeps the kernel head index as the Q head. The GQA
+decode case uses 16 Q heads and 2 KV heads, so FA2 packs each KV head's Q
+group into the sequence dimension and the tile head becomes the KV head.
+Shard 0 [0, 8) must keep that KV head's group and leave the other group at
+zero.
 
 A launch with no plan is the reference. With a plan, the local row matches
 it, the owner row keeps shard 0 and leaves the other heads at zero, and the
@@ -71,9 +73,9 @@ def _varlen(ops, q, k, v, row_kind, q_range, dp_size):
 
 
 def _kvcache(ops, q, k, v, row_kind, q_range, dp_size):
-    q_b = q.view(_BATCH, 1, _HEADS, _DIM)
-    k_b = k.view(_BATCH, _SEQ_K, _HEADS, _DIM)
-    v_b = v.view(_BATCH, _SEQ_K, _HEADS, _DIM)
+    q_b = q.view(_BATCH, 1, q.size(1), _DIM)
+    k_b = k.view(_BATCH, _SEQ_K, k.size(1), _DIM)
+    v_b = v.view(_BATCH, _SEQ_K, v.size(1), _DIM)
     out = torch.zeros_like(q_b)
     returned = ops.fwd_kvcache(
         q_b, k_b, v_b,
@@ -108,9 +110,53 @@ def test_fa2_tile_skip_matches_the_unplanned_forward():
     _check(full_split, planned_split)
 
 
+def _gqa_inputs():
+    generator = torch.Generator(device="cuda")
+    generator.manual_seed(0)
+    q_heads = 16
+    kv_heads = 2
+    q = torch.randn(_BATCH, q_heads, _DIM, dtype=torch.float16, device="cuda", generator=generator)
+    k = torch.randn(_BATCH * _SEQ_K, kv_heads, _DIM, dtype=torch.float16, device="cuda", generator=generator)
+    v = torch.randn(_BATCH * _SEQ_K, kv_heads, _DIM, dtype=torch.float16, device="cuda", generator=generator)
+    return q, k, v
+
+
+def _gqa_plan(q_heads):
+    row_kind = torch.tensor([0, 1, 2], dtype=torch.int8, device="cuda")
+    q_range = torch.zeros(_BATCH, _DP, 2, dtype=torch.int32, device="cuda")
+    q_range[:, 0, 1] = q_heads // 2
+    return row_kind, q_range
+
+
+def _check_gqa(full, planned, shard_end):
+    if not torch.equal(planned[0], full[0]):
+        raise AssertionError("local GQA row changed under a plan that keeps every head")
+    if not torch.equal(planned[1, :shard_end], full[1, :shard_end]):
+        raise AssertionError("owner GQA shard does not match the full forward")
+    outside = planned[1, shard_end:]
+    if not torch.equal(outside, torch.zeros_like(outside)):
+        raise AssertionError("owner GQA heads outside the shard were written")
+    if not torch.equal(planned[2], torch.zeros_like(planned[2])):
+        raise AssertionError("empty GQA row was written")
+
+
+def test_fa2_gqa_decode_skip_keeps_the_owner_kv_group():
+    ops = _require_cuda_ops()
+    q, k, v = _gqa_inputs()
+    shard_end = q.size(1) // 2
+    row_kind, q_range = _gqa_plan(q.size(1))
+    full = _varlen(ops, q, k, v, None, None, 0)
+    planned = _varlen(ops, q, k, v, row_kind, q_range, _DP)
+    _check_gqa(full, planned, shard_end)
+    full_split = _kvcache(ops, q, k, v, None, None, 0)
+    planned_split = _kvcache(ops, q, k, v, row_kind, q_range, _DP)
+    _check_gqa(full_split, planned_split, shard_end)
+
+
 if __name__ == "__main__":
     try:
         test_fa2_tile_skip_matches_the_unplanned_forward()
+        test_fa2_gqa_decode_skip_keeps_the_owner_kv_group()
     except unittest.SkipTest as exc:
         print(f"skip: {exc}")
     else:
