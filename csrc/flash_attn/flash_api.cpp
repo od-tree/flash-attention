@@ -1388,7 +1388,22 @@ mha_fwd_kvcache(Tensor q,                 // batch_size x seqlen_q x num_heads x
                 int64_t num_splits,
                 std::optional<Tensor> head_tp_row_kind,
                 std::optional<Tensor> head_tp_q_range,
-                int64_t head_tp_dp_size
+                int64_t head_tp_dp_size,
+                std::optional<Tensor> head_tp_slot_rank,
+                std::optional<Tensor> head_tp_kv_range,
+                std::optional<Tensor> head_tp_xchg_q_range,
+                std::optional<Tensor> head_tp_payload_q_ptrs,
+                std::optional<Tensor> head_tp_payload_k_ptrs,
+                std::optional<Tensor> head_tp_payload_v_ptrs,
+                std::optional<Tensor> head_tp_payload_out_ptrs,
+                std::optional<Tensor> head_tp_arrived_ptrs,
+                std::optional<Tensor> head_tp_arrived_local,
+                std::optional<Tensor> head_tp_payload_out,
+                std::optional<Tensor> head_tp_return_count,
+                int64_t head_tp_src_rank,
+                int64_t head_tp_max_q_per,
+                int64_t head_tp_max_kv_per,
+                int64_t head_tp_payload_tokens
                 ) {
 
     // Otherwise the kernel will be launched from cuda:0 device
@@ -1647,6 +1662,44 @@ mha_fwd_kvcache(Tensor q,                 // batch_size x seqlen_q x num_heads x
 
     set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
     set_params_head_tp(params, head_tp_row_kind, head_tp_q_range, head_tp_dp_size, batch_size);
+    if (head_tp_src_rank >= 0) {
+        auto need = [](const std::optional<Tensor>& tensor, const char* name) {
+            STD_TORCH_CHECK(tensor.has_value(), std::string(name) + " is required");
+            CHECK_DEVICE(tensor.value());
+            CHECK_CONTIGUOUS(tensor.value());
+            return tensor.value();
+        };
+        const Tensor slot = need(head_tp_slot_rank, "head_tp_slot_rank");
+        const Tensor kv = need(head_tp_kv_range, "head_tp_kv_range");
+        const Tensor xchg_q = need(head_tp_xchg_q_range, "head_tp_xchg_q_range");
+        const Tensor pq = need(head_tp_payload_q_ptrs, "head_tp_payload_q_ptrs");
+        const Tensor pk = need(head_tp_payload_k_ptrs, "head_tp_payload_k_ptrs");
+        const Tensor pv = need(head_tp_payload_v_ptrs, "head_tp_payload_v_ptrs");
+        const Tensor po = need(head_tp_payload_out_ptrs, "head_tp_payload_out_ptrs");
+        const Tensor ap = need(head_tp_arrived_ptrs, "head_tp_arrived_ptrs");
+        const Tensor al = need(head_tp_arrived_local, "head_tp_arrived_local");
+        const Tensor pl = need(head_tp_payload_out, "head_tp_payload_out");
+        const Tensor rc = need(head_tp_return_count, "head_tp_return_count");
+        STD_TORCH_CHECK(head_tp_dp_size > 0 && head_tp_max_q_per > 0 && head_tp_max_kv_per > 0 &&
+                            head_tp_payload_tokens >= batch_size,
+                        "head-TP exchange sizes are invalid");
+        params.head_tp_src_rank = static_cast<int>(head_tp_src_rank);
+        params.head_tp_num_q_heads = num_heads_og;
+        params.head_tp_max_q_per = static_cast<int>(head_tp_max_q_per);
+        params.head_tp_max_kv_per = static_cast<int>(head_tp_max_kv_per);
+        params.head_tp_payload_tokens = static_cast<int>(head_tp_payload_tokens);
+        params.head_tp_slot_rank = static_cast<int*>(slot.data_ptr());
+        params.head_tp_kv_range = static_cast<int*>(kv.data_ptr());
+        params.head_tp_xchg_q_range = static_cast<int*>(xchg_q.data_ptr());
+        params.head_tp_payload_q_ptrs = static_cast<int64_t*>(pq.data_ptr());
+        params.head_tp_payload_k_ptrs = static_cast<int64_t*>(pk.data_ptr());
+        params.head_tp_payload_v_ptrs = static_cast<int64_t*>(pv.data_ptr());
+        params.head_tp_payload_out_ptrs = static_cast<int64_t*>(po.data_ptr());
+        params.head_tp_arrived_ptrs = static_cast<int64_t*>(ap.data_ptr());
+        params.head_tp_arrived_local = static_cast<int*>(al.data_ptr());
+        params.head_tp_payload_out_local = pl.data_ptr();
+        params.head_tp_return_count = static_cast<int*>(rc.data_ptr());
+    }
 
     auto stream = get_current_cuda_stream(q);
     // Only split kernel supports appending to KV cache, or indexing to the cache with cache_batch_idx,

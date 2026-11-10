@@ -132,7 +132,14 @@ STABLE_TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
             "Tensor? rotary_cos, Tensor? rotary_sin, Tensor? cache_batch_idx, Tensor? leftpad_k, Tensor? block_table, "
             "Tensor? alibi_slopes, Tensor!? out, float softmax_scale, bool is_causal, int window_size_left, "
             "int window_size_right, float softcap, bool is_rotary_interleaved, int num_splits, "
-            "Tensor? head_tp_row_kind=None, Tensor? head_tp_q_range=None, int head_tp_dp_size=0) -> Tensor[]");
+            "Tensor? head_tp_row_kind=None, Tensor? head_tp_q_range=None, int head_tp_dp_size=0, "
+            "Tensor? head_tp_slot_rank=None, Tensor? head_tp_kv_range=None, Tensor? head_tp_xchg_q_range=None, "
+            "Tensor? head_tp_payload_q_ptrs=None, Tensor? head_tp_payload_k_ptrs=None, "
+            "Tensor? head_tp_payload_v_ptrs=None, Tensor? head_tp_payload_out_ptrs=None, "
+            "Tensor? head_tp_arrived_ptrs=None, Tensor? head_tp_arrived_local=None, "
+            "Tensor? head_tp_payload_out=None, Tensor? head_tp_return_count=None, "
+            "int head_tp_src_rank=-1, int head_tp_max_q_per=0, int head_tp_max_kv_per=0, "
+            "int head_tp_payload_tokens=0) -> Tensor[]");
 
 #ifndef FA2_MINIMAL_HDIM256_FP16
     ops.def("fwd_sparse(Tensor! q, Tensor k, Tensor v, "

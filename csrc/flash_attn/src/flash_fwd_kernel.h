@@ -24,6 +24,7 @@
 #include "dropout.h"
 #include "rotary.h"
 #include "head_tp_skip.h"
+#include "head_tp_overlap.h"
 
 namespace FLASH_NAMESPACE {
 
@@ -88,6 +89,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     const BlockInfo</*Varlen=*/!Is_even_MN> binfo(params, bidb);
     if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
     if (!head_tp_tile_active(params, bidb, bidh)) return;
+    head_tp_partner_wait(params, bidb);
 
     const int n_block_min = !Is_local ? 0 : std::max(0, (m_block * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q - params.window_size_left) / kBlockN);
     int n_block_max = cute::ceil_div(binfo.actual_seqlen_k, kBlockN);
@@ -500,6 +502,9 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
         gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, binfo.actual_seqlen_q - m_block * kBlockM
     );
+    if (m_block == 0 && params.num_splits <= 1) {
+        head_tp_partner_return_span<Element>(params, bidb, bidh, tidx, blockDim.x);
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -534,6 +539,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     // if (threadIdx.x == 0 && blockIdx.y == 1 && blockIdx.z == 0) { printf("params.knew_ptr = %p, seqlen_k_cache + seqlen_knew = %d\n", params.knew_ptr, binfo.seqlen_k_cache + (params.knew_ptr == nullptr ? 0 : params.seqlen_knew)); }
     if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
     if (!head_tp_tile_active(params, bidb, bidh)) return;
+    head_tp_partner_wait(params, bidb);
 
     const int n_blocks_per_split = ((binfo.actual_seqlen_k + kBlockN - 1) / kBlockN + num_n_splits - 1) / num_n_splits;
     const int n_block_min = !Is_local
@@ -581,6 +587,11 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         for (int m = 0; m < size<1>(tOgOaccum); ++m) {
             const int row = get<0>(tOcO(0, m, 0));
             if (row < binfo.actual_seqlen_q - m_block * kBlockM && get<1>(tOcO(0, m, 0)) == 0) { gLSEaccum(row) = Split ? -INFINITY : INFINITY; }
+        }
+        if constexpr (!Split) {
+            if (m_block == 0) {
+                head_tp_partner_return_span<Element>(params, bidb, bidh, tidx, blockDim.x);
+            }
         }
         return;
     }
@@ -1093,17 +1104,27 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
         gmem_tiled_copy_Oaccum, tOrOaccum, tOgOaccum, tOcO, tOpO, binfo.actual_seqlen_q - m_block * kBlockM
     );
+    if constexpr (!Split) {
+        if (m_block == 0) {
+            head_tp_partner_return_span<Element>(params, bidb, bidh, tidx, blockDim.x);
+        }
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
 inline __device__ void compute_attn(const Params &params) {
+    using Element = typename Kernel_traits::Element;
     const int m_block = blockIdx.x;
     // The block index for the batch.
     const int bidb = blockIdx.y;
     // The block index for the head.
     const int bidh = blockIdx.z;
+    if (head_tp_owner_block(params, bidb, bidh, m_block, 0)) {
+        head_tp_owner_send_wait_splice<Element>(params, bidb, threadIdx.x, blockDim.x);
+        return;
+    }
 
     // We want the fwd and bwd to generate the same dropout pattern (RNG), without restricting
     // them to have the same number of threads or have to traverse the attention matrix
@@ -1127,6 +1148,10 @@ inline __device__ void compute_attn_splitkv(const Params &params) {
     const int bidh = Split ? blockIdx.z - bidb * params.h : blockIdx.z;
     const int n_split_idx = Split ? blockIdx.y : 0;
     const int num_n_splits = Split ? gridDim.y : 1;
+    if (head_tp_owner_block(params, bidb, bidh, m_block, n_split_idx)) {
+        head_tp_owner_send_wait_splice<typename Kernel_traits::Element>(params, bidb, threadIdx.x, blockDim.x);
+        return;
+    }
     FLASH_NAMESPACE::compute_attn_1rowblock_splitkv<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Split, Append_KV>(params, bidb, bidh, m_block, n_split_idx, num_n_splits);
 }
 
@@ -1315,6 +1340,25 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
                     // reinterpret_cast<uint64_t *>(o_ptr)[col / 4] = recast<uint64_t>(rO)(0, m, k);
                 }
             }
+        }
+    }
+    if (params.head_tp_src_rank >= 0) {
+        for (int m = 0; m < kBlockM; ++m) {
+            int idx = bidx * kBlockM + m;
+            if (idx >= params.b * params.h * params.seqlen_q) {
+                continue;
+            }
+            int batch_idx = idx / (params.h * params.seqlen_q);
+            int head_idx = (idx - batch_idx * params.h * params.seqlen_q) / params.seqlen_q;
+            int row = idx - batch_idx * params.h * params.seqlen_q - head_idx * params.seqlen_q;
+            if (!head_tp_tile_active(params, batch_idx, head_idx)) {
+                continue;
+            }
+            int q_head = params.head_tp_q_per_kv > 1 ? head_idx * params.head_tp_q_per_kv + row : head_idx;
+            if (params.head_tp_q_per_kv <= 1 && row != 0) {
+                continue;
+            }
+            head_tp_partner_return_head<Element>(params, batch_idx, q_head, tidx, kNThreads);
         }
     }
 }

@@ -156,6 +156,28 @@ struct Flash_fwd_params : public Qkv_params {
     // size: fwd_kvcache swaps the layout without seqlenq_ngroups_swapped,
     // because that flag also rescales the batch stride.
     int head_tp_q_per_kv = 1;
+    // In-kernel exchange. src_rank < 0 leaves send, wait, return, and splice off.
+    // q_range above is only the shard this rank computes. xchg_q_range is the
+    // full [token, dp, 2] table. q and out storage stay in the caller's
+    // [token, q_heads, dim] order; the GQA swap is a view over that storage.
+    int head_tp_src_rank = -1;
+    int head_tp_num_q_heads = 0;
+    int head_tp_max_q_per = 0;
+    int head_tp_max_kv_per = 0;
+    int head_tp_payload_tokens = 0;
+    int *__restrict__ head_tp_slot_rank = nullptr;
+    int *__restrict__ head_tp_kv_range = nullptr;
+    int *__restrict__ head_tp_xchg_q_range = nullptr;
+    int64_t *__restrict__ head_tp_payload_q_ptrs = nullptr;
+    int64_t *__restrict__ head_tp_payload_k_ptrs = nullptr;
+    int64_t *__restrict__ head_tp_payload_v_ptrs = nullptr;
+    int64_t *__restrict__ head_tp_payload_out_ptrs = nullptr;
+    int64_t *__restrict__ head_tp_arrived_ptrs = nullptr;
+    int *__restrict__ head_tp_arrived_local = nullptr;
+    void *__restrict__ head_tp_payload_out_local = nullptr;
+    // One int per token. Partner heads atomicAdd it; the increment that
+    // finishes the shard publishes the return flag. The caller zeros it.
+    int *__restrict__ head_tp_return_count = nullptr;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

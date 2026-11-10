@@ -2,8 +2,8 @@
 
 Rank 0 owns the long rows. Rank 1 holds the other half of the short rows.
 Baseline keeps each long row on rank 0 and runs all 16 Q heads there.
-The cooperative step runs Q [0, 8) on rank 0 and Q [8, 16) on rank 1, with
-the current-token send, device wait, return, and splice on the two streams.
+The cooperative step runs Q [0, 8) on rank 0 and Q [8, 16) on rank 1.
+Send, the partner wait, the return, and the splice run inside fwd_kvcache.
 A long row uses one shared Q and KV cache on both ranks. Splice writes the
 partner shard into the owner's attention output. The check compares that
 merged output with one unplanned forward of the same cache. The 1% and 5% mixes are marked as the NanoCP-shaped loads. No
@@ -126,14 +126,16 @@ def _plan(n, n_long, q_begin, q_end, device):
     return row_kind, q_range
 
 
-def _fwd(ops, batch, out, row_kind, q_range, dp_size):
+def _fwd(ops, batch, out, row_kind, q_range, dp_size, xchg=None):
     q, k, v, seqlens = batch
+    tail = () if xchg is None else xchg
     ops.fwd_kvcache(
         q, k, v,
         None, None, seqlens,
         None, None, None, None, None, None,
         out, _SCALE, False, -1, -1, 0.0, False, 0,
         row_kind, q_range, dp_size,
+        *tail,
     )
 
 
@@ -265,17 +267,46 @@ class _Step:
         self.ptr_k = _pointers(self.payload_k, device)
         self.ptr_v = _pointers(self.payload_v, device)
         self.ptr_arrived_owner = _pointers(self.arrived, device)
+        self.ptr_out_owner = _pointers(self.payload_out, device)
+        self.ptr_q_partner = _pointers(self.payload_q, p)
+        self.ptr_k_partner = _pointers(self.payload_k, p)
+        self.ptr_v_partner = _pointers(self.payload_v, p)
         self.ptr_out = _pointers(self.payload_out, p)
         self.ptr_arrived_partner = _pointers(self.arrived, p)
+        self.slot_partner = self.slot_rank.to(p)
+        self.kv_partner = self.send_kv_range.to(p)
+        self.xchg_q_partner = self.send_q_range.to(p)
+        self.return_count = [
+            torch.zeros(g, dtype=torch.int32, device=device),
+            torch.zeros(g, dtype=torch.int32, device=p),
+        ]
         self.inbound = torch.tensor([self.n_long, 0], dtype=torch.int32, device=p)
         self.expect = torch.tensor([self.n_long], dtype=torch.int32, device=device)
 
-    def _attn(self, stream, ops_batch, out, plan):
+    def _xchg(self, src):
+        partner = src == _PARTNER
+        device_slot = self.slot_partner if partner else self.slot_rank
+        device_kv = self.kv_partner if partner else self.send_kv_range
+        device_q = self.xchg_q_partner if partner else self.send_q_range
+        ptr_q = self.ptr_q_partner if partner else self.ptr_q
+        ptr_k = self.ptr_k_partner if partner else self.ptr_k
+        ptr_v = self.ptr_v_partner if partner else self.ptr_v
+        ptr_out = self.ptr_out if partner else self.ptr_out_owner
+        ptr_arrived = self.ptr_arrived_partner if partner else self.ptr_arrived_owner
+        arrived = self.arrived[src]
+        payload = self.payload_out[src]
+        count = self.return_count[src]
+        return (
+            device_slot, device_kv, device_q, ptr_q, ptr_k, ptr_v, ptr_out, ptr_arrived,
+            arrived, payload, count, src, _SHARD, 1, self.global_n,
+        )
+
+    def _attn(self, stream, ops_batch, out, plan, xchg=None):
         if ops_batch is None:
             return
         row_kind, q_range, dp = (None, None, 0) if plan is None else (*plan, _DP)
         with torch.cuda.stream(stream):
-            _fwd(self.ops, ops_batch, out, row_kind, q_range, dp)
+            _fwd(self.ops, ops_batch, out, row_kind, q_range, dp, xchg)
 
     def baseline(self):
         self._attn(self.s0, self.owner_batch, self.owner_out, None)
@@ -284,59 +315,33 @@ class _Step:
         self.s1.synchronize()
 
     def cooperative(self):
-        # Flags have to be clear before send. Zeroing on the default stream
-        # can race the side streams and wipe a flag the other rank just wrote.
+        # Flags and the return counter have to be clear before either forward.
+        # Both forwards are then queued without a host wait between them: the
+        # owner tile sends while local tiles run, and the partner tile waits
+        # inside its own kernel.
         with torch.cuda.stream(self.s0):
             self.arrived[0].zero_()
+            self.return_count[0].zero_()
         with torch.cuda.stream(self.s1):
             self.arrived[1].zero_()
+            self.return_count[1].zero_()
         self.s0.synchronize()
         self.s1.synchronize()
         with torch.cuda.stream(self.s0):
-            # Skipped tiles do not store, so a reused or empty output has to be
-            # cleared on this stream before the planned forward.
             if self.owner_out is not None:
                 self.owner_out.zero_()
-            self.exchange.send(
-                self.send_q, self.send_k, self.send_v, self.send_row, self.slot_rank,
-                self.send_q_range, self.send_kv_range, self.ptr_q, self.ptr_k, self.ptr_v,
-                self.ptr_arrived_owner, _OWNER, _SHARD, 1,
-            )
             if self.owner_batch is not None:
-                _fwd(self.ops, self.owner_batch, self.owner_out, *self.owner_plan, _DP)
+                _fwd(
+                    self.ops, self.owner_batch, self.owner_out, *self.owner_plan, _DP,
+                    self._xchg(_OWNER),
+                )
         with torch.cuda.stream(self.s1):
-            self.exchange.wait(self.arrived[1], inbound=self.inbound)
             if self.partner_coop_out is not None:
                 self.partner_coop_out.zero_()
             if self.partner_coop is not None:
-                _fwd(self.ops, self.partner_coop, self.partner_coop_out, *self.partner_plan, _DP)
-            if self.n_long:
-                n = self.n_long
-                self.exchange.publish_return(
-                    self.partner_coop_out[:n],
-                    self.send_row[:n],
-                    self.slot_rank[:n],
-                    self.send_q_range[:n],
-                    self.ptr_out,
-                    self.ptr_arrived_partner,
-                    _PARTNER,
-                    _SHARD,
-                    self.global_n,
-                )
-        with torch.cuda.stream(self.s0):
-            self.exchange.wait(self.arrived[0], expect=self.expect)
-            if self.n_long:
-                # Long rows are the leading global tokens and the leading rows
-                # of the owner output. Splice writes Q [8, 16) into that output.
-                n = self.n_long
-                payload = self.payload_out[0][:, :n].contiguous()
-                self.exchange.splice_attention_output(
-                    self.owner_out[:n],
-                    payload,
-                    self.send_row[:n],
-                    self.slot_rank[:n],
-                    self.send_q_range[:n],
-                    _SHARD,
+                _fwd(
+                    self.ops, self.partner_coop, self.partner_coop_out, *self.partner_plan, _DP,
+                    self._xchg(_PARTNER),
                 )
         self.s0.synchronize()
         self.s1.synchronize()
