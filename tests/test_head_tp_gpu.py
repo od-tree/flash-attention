@@ -45,7 +45,7 @@ def _pointers(buffers):
     )
 
 
-def _gpu_exchange(world):
+def _gpu_exchange(world, out):
     """Run send, both waits, return, and splice on one CUDA device."""
     dp = len(world.ranks)
     tokens, num_q, dim = world.ranks[0].q.shape
@@ -96,22 +96,30 @@ def _gpu_exchange(world):
         )
     for rank in world.ranks:
         _exchange.wait(arrived[rank.rank], inbound=rank.inbound.to(device))
-    partial = torch.zeros(dp, tokens, q_per, dim, dtype=dtype, device=device)
-    q_len = torch.zeros(dp, tokens, dtype=torch.int32, device=device)
-    for src in range(dp):
-        for token in range(tokens):
-            if int(world.arrived[1, src, token]) != 1:
-                continue
-            shard = world.payload_out[src, 1, token]
-            width = shard.shape[0]
-            partial[src, token, :width] = shard.to(device)
-            q_len[src, token] = width
-    _exchange.publish_return(partial, q_len, ptr_out, ptr_arrived, 1, q_per)
+    attn_out = torch.zeros(tokens, num_q, dim, dtype=dtype)
     owner = world.ranks[0]
+    for token in range(tokens):
+        if int(owner.row_kind[token]) != 1:
+            continue
+        for slot in range(1, dp):
+            if int(owner.slot_rank[token, slot]) != 1:
+                continue
+            qb = int(owner.q_range[token, slot, 0])
+            qe = int(owner.q_range[token, slot, 1])
+            attn_out[token, qb:qe] = world.payload_out[0, 1, token, : qe - qb]
+    _exchange.publish_return(
+        attn_out.to(device),
+        owner.row_kind.to(device),
+        slot_rank,
+        q_range,
+        ptr_out,
+        ptr_arrived,
+        1,
+        q_per,
+    )
     expect = torch.tensor([_head.remote_shard_count(owner)], dtype=torch.int32, device=device)
     _exchange.wait(arrived[0], expect=expect)
-    out = torch.zeros(tokens, num_q, dim, dtype=dtype, device=device)
-    _exchange.splice(
+    _exchange.splice_attention_output(
         out,
         payload_out[0],
         owner.row_kind.to(device),
@@ -141,14 +149,19 @@ def test_gpu_exchange_matches_cpu_reference():
     world, _scale = _ref._world(
         q, k, v, history_k, history_v, seq_len, row_kind, slot_rank, q_range, kv_range, degree
     )
-    _head.send_current(world)
+    _head.phase_local_and_send(world)
     sent_q = world.payload_q.clone()
     sent_k = world.payload_k.clone()
     sent_v = world.payload_v.clone()
     sent_flags = world.arrived.clone()
     _head.phase_partner(world)
+    # rank.out already holds local attention. Splice fills the partner heads
+    # in that same tensor. FA2 decode is [tokens, 1, heads, dim]; this
+    # reference and FA3/FA4 varlen are [tokens, heads, dim].
+    before = world.ranks[0].out.clone()
     _head.phase_splice(world)
-    payload_q, payload_k, payload_v, payload_out, arrived, out = _gpu_exchange(world)
+    out = before.to(device=torch.device("cuda"))
+    payload_q, payload_k, payload_v, payload_out, arrived, out = _gpu_exchange(world, out)
     for dst in range(degree):
         torch.testing.assert_close(payload_q[dst].cpu(), sent_q[dst])
         torch.testing.assert_close(payload_k[dst].cpu(), sent_k[dst])
@@ -159,8 +172,7 @@ def test_gpu_exchange_matches_cpu_reference():
     assert int(sent_flags[:, :, 2].sum()) == 0
     assert int(sent_flags[1, 0, 1]) == 1
     assert int(sent_flags[0, 1, 1]) == 0
-    qb, qe = int(q_range[1, 1, 0]), int(q_range[1, 1, 1])
-    torch.testing.assert_close(out[1, qb:qe].cpu(), world.ranks[0].out[1, qb:qe])
+    torch.testing.assert_close(out.cpu(), world.ranks[0].out)
 
 
 if __name__ == "__main__":

@@ -7,8 +7,9 @@
  *   2. head_tp_wait    inbound sum 0 returns immediately; otherwise spin on
  *                      this rank's arrived until that many cells are 1
  *   3. attention on the received Q (not this file)
- *   4. head_tp_return  write partial outputs into the owner's payload_out and
- *                      set arrived[owner][peer, token] = 1
+ *   4. head_tp_return  read the partner attention output at q_range, write that
+ *                      shard into the owner's payload_out, and set
+ *                      arrived[owner][peer, token] = 1
  *   5. head_tp_wait    again, with expect = number of return shards
  *   6. head_tp_splice  copy those shards into out by q_range
  *
@@ -60,10 +61,13 @@ struct HeadTpReturnArgs {
     int dp_size;
     int num_tokens;
     int head_dim;
+    int num_q_heads;
     int max_q_per;
     int element_size;
-    const void* partial;
-    const int* q_len;
+    const void* out;
+    const int8_t* row_kind;
+    const int* slot_rank;
+    const int* q_range;
     const int64_t* payload_out_ptrs;
     const int64_t* arrived_ptrs;
 };

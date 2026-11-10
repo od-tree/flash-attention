@@ -49,10 +49,60 @@ def wait(arrived, inbound=None, expect=None):
 
 
 def publish_return(
-    partial, q_len, payload_out_ptrs, arrived_ptrs, src_rank, max_q_per
+    out, row_kind, slot_rank, q_range, payload_out_ptrs, arrived_ptrs, src_rank, max_q_per
 ):
-    _ops().head_tp_return(partial, q_len, payload_out_ptrs, arrived_ptrs, src_rank, max_q_per)
+    """Copy this rank's attention heads back to the owner.
+
+    ``out`` is the attention output, indexed like the Q that ``send`` reads.
+    The kernel copies ``q_range`` for the slot owned by ``src_rank``.
+    """
+    _ops().head_tp_return(
+        attention_output_rows(out),
+        row_kind,
+        slot_rank,
+        q_range,
+        payload_out_ptrs,
+        arrived_ptrs,
+        src_rank,
+        max_q_per,
+    )
 
 
 def splice(out, payload_out, row_kind, slot_rank, q_range, max_q_per):
     _ops().head_tp_splice(out, payload_out, row_kind, slot_rank, q_range, max_q_per)
+
+
+def attention_output_rows(out):
+    """View an attention output as [tokens, heads, dim].
+
+    FA2 ``fwd_kvcache`` and FA3/FA4 decode both use one query position, stored
+    as [tokens, 1, heads, dim]. FA4 varlen and the CPU reference store
+    [tokens, heads, dim]. The storage is the attention output either way.
+    """
+    if out.dim() == 3:
+        rows = out
+    elif out.dim() == 4 and out.size(1) == 1:
+        rows = out.view(out.size(0), out.size(2), out.size(3))
+    else:
+        raise ValueError(
+            "attention output must be [tokens, heads, dim] or [tokens, 1, heads, dim]"
+        )
+    if not rows.is_contiguous():
+        raise ValueError("attention output rows must be contiguous")
+    return rows
+
+
+def splice_attention_output(out, payload_out, row_kind, slot_rank, q_range, max_q_per):
+    """Copy returned shards into the attention output, in place.
+
+    ``out`` is the tensor the attention kernel already wrote. Partner heads
+    that the kernel left untouched are filled from ``payload_out``.
+    """
+    splice(
+        attention_output_rows(out),
+        payload_out,
+        row_kind,
+        slot_rank,
+        q_range,
+        max_q_per,
+    )

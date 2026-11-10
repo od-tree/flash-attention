@@ -120,22 +120,35 @@ __global__ void head_tp_wait_kernel(HeadTpWaitArgs args) {
 
 __global__ void head_tp_return_kernel(HeadTpReturnArgs args) {
     int token = static_cast<int>(blockIdx.x);
-    int src = static_cast<int>(blockIdx.y);
-    if (token >= args.num_tokens || src < 0 || src >= args.dp_size || src == args.src_rank) {
+    int slot = static_cast<int>(blockIdx.y);
+    if (token >= args.num_tokens || slot <= 0 || slot >= args.dp_size) {
         return;
     }
-    int q_len = args.q_len[src * args.num_tokens + token];
-    if (q_len <= 0 || q_len > args.max_q_per) {
+    if (args.row_kind[token] != 1) {
+        return;
+    }
+    int peer = args.slot_rank[token * args.dp_size + slot];
+    if (peer != args.src_rank) {
+        return;
+    }
+    int owner = args.slot_rank[token * args.dp_size];
+    if (owner < 0 || owner >= args.dp_size || owner == args.src_rank) {
+        return;
+    }
+    const int* q_pair = args.q_range + (token * args.dp_size + slot) * 2;
+    int q_len = q_pair[1] - q_pair[0];
+    if (q_pair[0] < 0 || q_len <= 0 || q_len > args.max_q_per ||
+        q_pair[0] + q_len > args.num_q_heads) {
         return;
     }
     int es = args.element_size;
     int row = args.head_dim * es;
-    const char* partial = static_cast<const char*>(args.partial);
-    char* payload_out = static_cast<char*>(peer_ptr(args.payload_out_ptrs, src));
-    int* arrived = static_cast<int*>(peer_ptr(args.arrived_ptrs, src));
-    int src_off = ((src * args.num_tokens + token) * args.max_q_per * args.head_dim) * es;
+    const char* out = static_cast<const char*>(args.out);
+    char* payload_out = static_cast<char*>(peer_ptr(args.payload_out_ptrs, owner));
+    int* arrived = static_cast<int*>(peer_ptr(args.arrived_ptrs, owner));
+    int src_off = ((token * args.num_q_heads + q_pair[0]) * args.head_dim) * es;
     int dst_off = ((args.src_rank * args.num_tokens + token) * args.max_q_per * args.head_dim) * es;
-    copy_bytes(payload_out + dst_off, partial + src_off, q_len * row, threadIdx.x, blockDim.x);
+    copy_bytes(payload_out + dst_off, out + src_off, q_len * row, threadIdx.x, blockDim.x);
     publish(arrived + args.src_rank * args.num_tokens + token);
 }
 

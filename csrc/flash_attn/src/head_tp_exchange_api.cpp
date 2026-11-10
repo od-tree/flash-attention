@@ -157,40 +157,51 @@ void head_tp_wait_op(const Tensor& arrived, std::optional<Tensor> inbound, std::
     check_launch(head_tp_wait(args, current_stream(arrived)), "head_tp_wait");
 }
 
-void head_tp_return_op(const Tensor& partial,
-                       const Tensor& q_len,
+void head_tp_return_op(const Tensor& out,
+                       const Tensor& row_kind,
+                       const Tensor& slot_rank,
+                       const Tensor& q_range,
                        const Tensor& payload_out_ptrs,
                        const Tensor& arrived_ptrs,
                        int64_t src_rank,
                        int64_t max_q_per) {
-    check_cuda_contiguous(partial, "partial");
-    check_cuda_contiguous(q_len, "q_len");
-    int element_size = element_size_of(partial.scalar_type());
-    HEAD_TP_CHECK(element_size != 0, "partial must be fp16, bf16, or fp32");
-    HEAD_TP_CHECK(partial.dim() == 4, "partial must be [dp, tokens, max_q_per, dim]");
-    int dp_size = static_cast<int>(partial.size(0));
-    int num_tokens = static_cast<int>(partial.size(1));
-    int head_dim = static_cast<int>(partial.size(3));
-    HEAD_TP_CHECK(partial.size(2) == max_q_per, "partial head capacity must equal max_q_per");
-    HEAD_TP_CHECK(q_len.scalar_type() == ScalarType::Int, "q_len must be int32");
-    HEAD_TP_CHECK(q_len.sizes().equals({dp_size, num_tokens}), "q_len must be [dp, tokens]");
+    check_cuda_contiguous(out, "out");
+    check_cuda_contiguous(row_kind, "row_kind");
+    check_cuda_contiguous(slot_rank, "slot_rank");
+    check_cuda_contiguous(q_range, "q_range");
+    int element_size = element_size_of(out.scalar_type());
+    HEAD_TP_CHECK(element_size != 0, "out must be fp16, bf16, or fp32");
+    HEAD_TP_CHECK(out.dim() == 3, "out must be [tokens, heads, dim]");
+    int num_tokens = static_cast<int>(out.size(0));
+    int num_q_heads = static_cast<int>(out.size(1));
+    int head_dim = static_cast<int>(out.size(2));
+    HEAD_TP_CHECK(slot_rank.dim() == 2 && slot_rank.size(0) == num_tokens, "slot_rank must be [tokens, dp]");
+    int dp_size = static_cast<int>(slot_rank.size(1));
+    HEAD_TP_CHECK(row_kind.scalar_type() == ScalarType::Char && row_kind.numel() == num_tokens,
+                  "row_kind must be int8 [tokens]");
+    HEAD_TP_CHECK(slot_rank.scalar_type() == ScalarType::Int && q_range.scalar_type() == ScalarType::Int,
+                  "slot_rank and q_range must be int32");
+    HEAD_TP_CHECK(q_range.sizes().equals({num_tokens, dp_size, 2}), "q_range must be [tokens, dp, 2]");
     check_ptrs(payload_out_ptrs, dp_size, "payload_out_ptrs");
     check_ptrs(arrived_ptrs, dp_size, "arrived_ptrs");
     HEAD_TP_CHECK(src_rank >= 0 && src_rank < dp_size, "src_rank is out of range");
-    HEAD_TP_CHECK(reinterpret_cast<uintptr_t>(partial.data_ptr()) % 16 == 0, "partial must be 16-byte aligned");
+    HEAD_TP_CHECK(reinterpret_cast<uintptr_t>(out.data_ptr()) % 16 == 0, "out must be 16-byte aligned");
 
     HeadTpReturnArgs args{};
     args.src_rank = static_cast<int>(src_rank);
     args.dp_size = dp_size;
     args.num_tokens = num_tokens;
     args.head_dim = head_dim;
+    args.num_q_heads = num_q_heads;
     args.max_q_per = static_cast<int>(max_q_per);
     args.element_size = element_size;
-    args.partial = partial.data_ptr();
-    args.q_len = static_cast<const int*>(q_len.data_ptr());
+    args.out = out.data_ptr();
+    args.row_kind = static_cast<const int8_t*>(row_kind.data_ptr());
+    args.slot_rank = static_cast<const int*>(slot_rank.data_ptr());
+    args.q_range = static_cast<const int*>(q_range.data_ptr());
     args.payload_out_ptrs = static_cast<const int64_t*>(payload_out_ptrs.data_ptr());
     args.arrived_ptrs = static_cast<const int64_t*>(arrived_ptrs.data_ptr());
-    check_launch(head_tp_return(args, current_stream(partial)), "head_tp_return");
+    check_launch(head_tp_return(args, current_stream(out)), "head_tp_return");
 }
 
 void head_tp_splice_op(Tensor out,
@@ -247,8 +258,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT_EXPAND(TORCH_EXTENSION_NAME, head_tp_ops) {
         "Tensor payload_v_ptrs, Tensor arrived_ptrs, int src_rank, int max_q_per, int max_kv_per) -> ()");
     head_tp_ops.def("head_tp_wait(Tensor arrived, Tensor? inbound, Tensor? expect) -> ()");
     head_tp_ops.def(
-        "head_tp_return(Tensor partial, Tensor q_len, Tensor payload_out_ptrs, Tensor arrived_ptrs, "
-        "int src_rank, int max_q_per) -> ()");
+        "head_tp_return(Tensor out, Tensor row_kind, Tensor slot_rank, Tensor q_range, "
+        "Tensor payload_out_ptrs, Tensor arrived_ptrs, int src_rank, int max_q_per) -> ()");
     head_tp_ops.def(
         "head_tp_splice(Tensor! out, Tensor payload_out, Tensor row_kind, Tensor slot_rank, "
         "Tensor q_range, int max_q_per) -> ()");

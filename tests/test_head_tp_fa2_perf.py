@@ -138,6 +138,10 @@ def _run_case(ops, case):
         warmup, iters,
     )
     original = out.detach().clone()
+    # Skipped tiles do not store. Clear the full-forward result before timing
+    # the planned launch, or inactive heads still hold that result.
+    out.zero_()
+    torch.cuda.synchronize()
     head_tp_ms = _median_ms(
         lambda: _launch(ops, q, k, v, seqlens, out, row_kind, q_range, case.degree),
         warmup, iters,

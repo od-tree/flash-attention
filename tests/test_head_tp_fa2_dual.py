@@ -4,8 +4,10 @@ Rank 0 owns the long rows. Rank 1 holds the other half of the short rows.
 Baseline keeps each long row on rank 0 and runs all 16 Q heads there.
 The cooperative step runs Q [0, 8) on rank 0 and Q [8, 16) on rank 1, with
 the current-token send, device wait, return, and splice on the two streams.
-History KV is already in each rank's cache. The 1% and 5% mixes are marked
-as the NanoCP-shaped loads. No 50 ms or 3 x T0 threshold is applied.
+A long row uses one shared Q and KV cache on both ranks. Splice writes the
+partner shard into the owner's attention output. The check compares that
+merged output with one unplanned forward of the same cache. The 1% and 5% mixes are marked as the NanoCP-shaped loads. No
+50 ms or 3 x T0 threshold is applied.
 
 Requires two CUDA devices with peer access. Skips otherwise.
 """
@@ -62,7 +64,7 @@ def _require_two_gpus():
     if not torch.cuda.can_device_access_peer(0, 1):
         raise unittest.SkipTest("cuda:0 cannot access cuda:1")
     lib = None
-    for name in ("libcudart.so", "libcudart.so.12"):
+    for name in ("libcudart.so", "libcudart.so.12", "libcudart.so.13"):
         try:
             lib = ctypes.CDLL(name)
             break
@@ -198,7 +200,17 @@ class _Step:
             self.owner_plan = _plan(len(self.owner_ids), self.n_long, 0, _SHARD, self.owner)
         if self.partner_coop is not None:
             self.partner_plan = _plan(len(self.partner_coop_ids), self.n_long, _SHARD, _Q, self.partner)
+        self._share_long_rows()
         self._exchange_buffers()
+
+    def _share_long_rows(self):
+        # Partner attention has to see the same long-row Q and KV as the owner.
+        # Short rows stay on the rank that owns them.
+        if not self.n_long or self.partner_coop is None:
+            return
+        n = self.n_long
+        for src, dst in zip(self.owner_batch[:3], self.partner_coop[:3]):
+            dst[:n].copy_(src[:n])
 
     def _exchange_buffers(self):
         g = self.global_n
@@ -221,6 +233,13 @@ class _Step:
             self.send_kv_range[ids, 0, 1] = 1
             self.send_kv_range[ids, 1, 0] = 1
             self.send_kv_range[ids, 1, 1] = _KV
+            q, k, v, seqlens = self.owner_batch
+            n = self.n_long
+            pos = (seqlens[:n] - 1).to(torch.long)
+            self.send_q[:n] = q[:n, 0]
+            index = pos.view(n, 1, 1, 1).expand(n, 1, _KV, _DIM)
+            self.send_k[:n] = k[:n].gather(1, index).squeeze(1)
+            self.send_v[:n] = v[:n].gather(1, index).squeeze(1)
         p = self.partner
         self.payload_q = [
             torch.zeros(_DP, g, _SHARD, _DIM, dtype=torch.float16, device=self.owner),
@@ -248,12 +267,8 @@ class _Step:
         self.ptr_arrived_owner = _pointers(self.arrived, device)
         self.ptr_out = _pointers(self.payload_out, p)
         self.ptr_arrived_partner = _pointers(self.arrived, p)
-        self.partial = torch.zeros(_DP, g, _SHARD, _DIM, dtype=torch.float16, device=p)
-        self.q_len = torch.zeros(_DP, g, dtype=torch.int32, device=p)
         self.inbound = torch.tensor([self.n_long, 0], dtype=torch.int32, device=p)
         self.expect = torch.tensor([self.n_long], dtype=torch.int32, device=device)
-        self.splice_out = torch.zeros(g, _Q, _DIM, dtype=torch.float16, device=device)
-        self.long_ids = torch.tensor(self.longs, dtype=torch.long, device=p)
 
     def _attn(self, stream, ops_batch, out, plan):
         if ops_batch is None:
@@ -275,10 +290,13 @@ class _Step:
             self.arrived[0].zero_()
         with torch.cuda.stream(self.s1):
             self.arrived[1].zero_()
-            self.q_len.zero_()
         self.s0.synchronize()
         self.s1.synchronize()
         with torch.cuda.stream(self.s0):
+            # Skipped tiles do not store, so a reused or empty output has to be
+            # cleared on this stream before the planned forward.
+            if self.owner_out is not None:
+                self.owner_out.zero_()
             self.exchange.send(
                 self.send_q, self.send_k, self.send_v, self.send_row, self.slot_rank,
                 self.send_q_range, self.send_kv_range, self.ptr_q, self.ptr_k, self.ptr_v,
@@ -288,33 +306,73 @@ class _Step:
                 _fwd(self.ops, self.owner_batch, self.owner_out, *self.owner_plan, _DP)
         with torch.cuda.stream(self.s1):
             self.exchange.wait(self.arrived[1], inbound=self.inbound)
+            if self.partner_coop_out is not None:
+                self.partner_coop_out.zero_()
             if self.partner_coop is not None:
                 _fwd(self.ops, self.partner_coop, self.partner_coop_out, *self.partner_plan, _DP)
             if self.n_long:
-                self.partial[0, self.long_ids] = self.partner_coop_out[: self.n_long, 0, _SHARD:]
-                self.q_len[0, self.long_ids] = _SHARD
-            self.exchange.publish_return(
-                self.partial, self.q_len, self.ptr_out, self.ptr_arrived_partner, _PARTNER, _SHARD,
-            )
+                n = self.n_long
+                self.exchange.publish_return(
+                    self.partner_coop_out[:n],
+                    self.send_row[:n],
+                    self.slot_rank[:n],
+                    self.send_q_range[:n],
+                    self.ptr_out,
+                    self.ptr_arrived_partner,
+                    _PARTNER,
+                    _SHARD,
+                )
         with torch.cuda.stream(self.s0):
             self.exchange.wait(self.arrived[0], expect=self.expect)
-            self.exchange.splice(
-                self.splice_out, self.payload_out[0], self.send_row, self.slot_rank,
-                self.send_q_range, _SHARD,
-            )
+            if self.n_long:
+                # Long rows are the leading global tokens and the leading rows
+                # of the owner output. Splice writes Q [8, 16) into that output.
+                n = self.n_long
+                payload = self.payload_out[0][:, :n].contiguous()
+                self.exchange.splice_attention_output(
+                    self.owner_out[:n],
+                    payload,
+                    self.send_row[:n],
+                    self.slot_rank[:n],
+                    self.send_q_range[:n],
+                    _SHARD,
+                )
         self.s0.synchronize()
         self.s1.synchronize()
 
     def check(self):
         if not self.n_long:
             return
-        got = self.splice_out[self.longs, _SHARD:]
-        ref = self.partner_coop_out[: self.n_long, 0, _SHARD:].to(got.device)
-        if not torch.equal(got, ref):
-            raise AssertionError("spliced partner heads differ from the partner forward")
-        owner_other = self.owner_out[: self.n_long, 0, _SHARD:]
-        if not torch.equal(owner_other, torch.zeros_like(owner_other)):
-            raise AssertionError("owner forward wrote the partner Q heads")
+        n = self.n_long
+        ref = torch.empty_like(self.owner_out)
+        _fwd(self.ops, self.owner_batch, ref, None, None, 0)
+        torch.cuda.synchronize(self.owner)
+        ref_long = ref[:n, 0]
+        owner_long = self.owner_out[:n, 0]
+        if not torch.equal(owner_long, ref_long):
+            raise AssertionError("merged owner output differs from the full forward")
+        if self.owner_out.size(0) > n:
+            if not torch.equal(self.owner_out[n:], ref[n:]):
+                raise AssertionError("an owner local row changed")
+        partner_long = self.partner_coop_out[:n, 0]
+        partner_shard = partner_long[:, _SHARD:].to(ref.device)
+        if not torch.equal(partner_shard, ref_long[:, _SHARD:]):
+            raise AssertionError("partner shard differs from the full forward")
+        partner_other = partner_long[:, :_SHARD]
+        if not torch.equal(partner_other, torch.zeros_like(partner_other)):
+            raise AssertionError("partner forward wrote the owner Q heads")
+        sent_q = self.send_q[:n, _SHARD:]
+        got_q = self.payload_q[_PARTNER][_OWNER, :n].to(sent_q.device)
+        if not torch.equal(got_q, sent_q):
+            raise AssertionError("partner did not receive the current Q shard")
+        sent_k = self.send_k[:n, 1:]
+        got_k = self.payload_k[_PARTNER][_OWNER, :n].to(sent_k.device)
+        if not torch.equal(got_k, sent_k):
+            raise AssertionError("partner did not receive the current K")
+        sent_v = self.send_v[:n, 1:]
+        got_v = self.payload_v[_PARTNER][_OWNER, :n].to(sent_v.device)
+        if not torch.equal(got_v, sent_v):
+            raise AssertionError("partner did not receive the current V")
 
 
 def _nanocp(name):
