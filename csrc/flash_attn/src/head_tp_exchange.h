@@ -8,8 +8,10 @@
  *                      this rank's arrived until that many cells are 1
  *   3. attention on the received Q (not this file)
  *   4. head_tp_return  read the partner attention output at q_range, write that
- *                      shard into the owner's payload_out, and set
- *                      arrived[owner][peer, token] = 1
+ *                      shard into the owner's payload_out at [peer, token], and
+ *                      set arrived[owner][peer, token] = 1. payload_tokens is
+ *                      the token stride of that buffer and may exceed the rows
+ *                      in this launch.
  *   5. head_tp_wait    again, with expect = number of return shards
  *   6. head_tp_splice  copy those shards into out by q_range
  *
@@ -60,6 +62,7 @@ struct HeadTpReturnArgs {
     int src_rank;
     int dp_size;
     int num_tokens;
+    int payload_tokens;
     int head_dim;
     int num_q_heads;
     int max_q_per;

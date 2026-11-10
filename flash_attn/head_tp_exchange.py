@@ -7,12 +7,27 @@ these launches: send, wait, partner attention, return, wait, splice.
 """
 
 
-def _ops():
+def _loaded_ops():
     import torch
 
     for name in ("_vllm_fa2_C", "_vllm_fa3_C"):
         module = getattr(torch.ops, name, None)
         if module is not None and hasattr(module, "head_tp_send"):
+            return module
+    return None
+
+
+def _ops():
+    module = _loaded_ops()
+    if module is not None:
+        return module
+    for name in ("vllm_flash_attn._vllm_fa2_C", "vllm_flash_attn._vllm_fa3_C"):
+        try:
+            __import__(name)
+        except ImportError:
+            continue
+        module = _loaded_ops()
+        if module is not None:
             return module
     raise RuntimeError("head_tp exchange kernels are not loaded")
 
@@ -49,12 +64,23 @@ def wait(arrived, inbound=None, expect=None):
 
 
 def publish_return(
-    out, row_kind, slot_rank, q_range, payload_out_ptrs, arrived_ptrs, src_rank, max_q_per
+    out,
+    row_kind,
+    slot_rank,
+    q_range,
+    payload_out_ptrs,
+    arrived_ptrs,
+    src_rank,
+    max_q_per,
+    payload_tokens,
 ):
     """Copy this rank's attention heads back to the owner.
 
     ``out`` is the attention output, indexed like the Q that ``send`` reads.
     The kernel copies ``q_range`` for the slot owned by ``src_rank``.
+    ``payload_tokens`` is the token count of the peer buffer
+    ``[dp, payload_tokens, max_q_per, dim]``. ``out`` may be a prefix of that
+    axis; the copy still lands at ``[src_rank, token]``.
     """
     _ops().head_tp_return(
         attention_output_rows(out),
@@ -65,6 +91,7 @@ def publish_return(
         arrived_ptrs,
         src_rank,
         max_q_per,
+        payload_tokens,
     )
 
 

@@ -321,6 +321,7 @@ class _Step:
                     self.ptr_arrived_partner,
                     _PARTNER,
                     _SHARD,
+                    self.global_n,
                 )
         with torch.cuda.stream(self.s0):
             self.exchange.wait(self.arrived[0], expect=self.expect)

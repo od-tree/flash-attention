@@ -116,6 +116,7 @@ def _gpu_exchange(world, out):
         ptr_arrived,
         1,
         q_per,
+        tokens,
     )
     expect = torch.tensor([_head.remote_shard_count(owner)], dtype=torch.int32, device=device)
     _exchange.wait(arrived[0], expect=expect)

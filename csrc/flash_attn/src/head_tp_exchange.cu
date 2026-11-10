@@ -147,9 +147,10 @@ __global__ void head_tp_return_kernel(HeadTpReturnArgs args) {
     char* payload_out = static_cast<char*>(peer_ptr(args.payload_out_ptrs, owner));
     int* arrived = static_cast<int*>(peer_ptr(args.arrived_ptrs, owner));
     int src_off = ((token * args.num_q_heads + q_pair[0]) * args.head_dim) * es;
-    int dst_off = ((args.src_rank * args.num_tokens + token) * args.max_q_per * args.head_dim) * es;
+    int dst_off =
+        ((args.src_rank * args.payload_tokens + token) * args.max_q_per * args.head_dim) * es;
     copy_bytes(payload_out + dst_off, out + src_off, q_len * row, threadIdx.x, blockDim.x);
-    publish(arrived + args.src_rank * args.num_tokens + token);
+    publish(arrived + args.src_rank * args.payload_tokens + token);
 }
 
 __global__ void head_tp_splice_kernel(HeadTpSpliceArgs args) {

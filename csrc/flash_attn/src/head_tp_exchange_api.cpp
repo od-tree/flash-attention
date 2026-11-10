@@ -164,7 +164,8 @@ void head_tp_return_op(const Tensor& out,
                        const Tensor& payload_out_ptrs,
                        const Tensor& arrived_ptrs,
                        int64_t src_rank,
-                       int64_t max_q_per) {
+                       int64_t max_q_per,
+                       int64_t payload_tokens) {
     check_cuda_contiguous(out, "out");
     check_cuda_contiguous(row_kind, "row_kind");
     check_cuda_contiguous(slot_rank, "slot_rank");
@@ -185,12 +186,14 @@ void head_tp_return_op(const Tensor& out,
     check_ptrs(payload_out_ptrs, dp_size, "payload_out_ptrs");
     check_ptrs(arrived_ptrs, dp_size, "arrived_ptrs");
     HEAD_TP_CHECK(src_rank >= 0 && src_rank < dp_size, "src_rank is out of range");
+    HEAD_TP_CHECK(payload_tokens >= num_tokens, "payload_tokens is shorter than out");
     HEAD_TP_CHECK(reinterpret_cast<uintptr_t>(out.data_ptr()) % 16 == 0, "out must be 16-byte aligned");
 
     HeadTpReturnArgs args{};
     args.src_rank = static_cast<int>(src_rank);
     args.dp_size = dp_size;
     args.num_tokens = num_tokens;
+    args.payload_tokens = static_cast<int>(payload_tokens);
     args.head_dim = head_dim;
     args.num_q_heads = num_q_heads;
     args.max_q_per = static_cast<int>(max_q_per);
@@ -259,7 +262,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT_EXPAND(TORCH_EXTENSION_NAME, head_tp_ops) {
     head_tp_ops.def("head_tp_wait(Tensor arrived, Tensor? inbound, Tensor? expect) -> ()");
     head_tp_ops.def(
         "head_tp_return(Tensor out, Tensor row_kind, Tensor slot_rank, Tensor q_range, "
-        "Tensor payload_out_ptrs, Tensor arrived_ptrs, int src_rank, int max_q_per) -> ()");
+        "Tensor payload_out_ptrs, Tensor arrived_ptrs, int src_rank, int max_q_per, "
+        "int payload_tokens) -> ()");
     head_tp_ops.def(
         "head_tp_splice(Tensor! out, Tensor payload_out, Tensor row_kind, Tensor slot_rank, "
         "Tensor q_range, int max_q_per) -> ()");
