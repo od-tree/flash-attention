@@ -1,10 +1,11 @@
 /******************************************************************************
  * Head-TP exchange inside the paged FA2 forward.
  *
- * Idle KV-head tiles on the owner each send one remote slot, overlapping the
- * owner's active tiles. A partner tile waits for that send, appends the current
- * K/V into its packed page, runs the mainloop, then copies its Q heads back.
- * The sending tile overwrites the owner's output at that slot's q_range.
+ * Send CTAs are the first linear block ids. Each one copies the current token
+ * and publishes the flag, then returns. It does not read KV and it does not
+ * wait. The active tile waits only on the partner, runs the mainloop, and the
+ * owner splices after its own store (or after the split-KV combine). Idle KV
+ * heads do not send and do not spin.
  *
  * The current token's partner K/V is not in this rank's packed page. It is read
  * from head_tp_k_token / head_tp_v_token, one row per request.
@@ -199,6 +200,32 @@ __device__ void head_tp_owner_send(const Params &params, int token, int slot, in
     __syncthreads();
 }
 
+// One CTA per (token, remote slot), launched ahead of every compute tile.
+// Short rows and non-owners return without touching KV.
+template <typename Element, typename Params>
+__device__ void head_tp_priority_send(const Params &params, int linear, int tid, int nthreads) {
+    if (!head_tp_exchange_on(params)) {
+        return;
+    }
+    const int span = params.head_tp_dp_size - 1;
+    if (span <= 0) {
+        return;
+    }
+    const int token = linear / span;
+    const int slot = 1 + linear % span;
+    if (token < 0 || token >= params.b || params.head_tp_row_kind[token] != 1) {
+        return;
+    }
+    if (!head_tp_is_owner(params, token)) {
+        return;
+    }
+    const int dst = params.head_tp_slot_rank[token * params.head_tp_dp_size + slot];
+    if (dst < 0 || dst == params.head_tp_src_rank) {
+        return;
+    }
+    head_tp_owner_send<Element>(params, token, slot, tid, nthreads);
+}
+
 template <typename Element, typename Params>
 __device__ void head_tp_partner_prepare(const Params &params, int token, int kv_head, int m_block, int k_block_m,
                                        int seqlen_q, int tid, int nthreads) {
@@ -382,6 +409,91 @@ __device__ void head_tp_owner_splice(const Params &params, int token, int slot, 
             dim * es;
         const int64_t dst = head_tp_vec_offset(params, token, q_head, true) * es;
         head_tp_copy(out + dst, payload + src, dim * es, tid, nthreads);
+    }
+}
+
+// Split-KV publishes the return only after combine has written the final out.
+// Each combine block copies the Q rows it owns; the last block releases the flag.
+// The owner's block that owns row 0 of the active KV head splices after that.
+template <typename Element, typename Params>
+__device__ void head_tp_after_combine(const Params &params, int bidx, int kBlockM, int tid, int nthreads) {
+    if (!head_tp_exchange_on(params) || !params.seqlenq_ngroups_swapped) {
+        return;
+    }
+    const int span = params.b * params.h * params.seqlen_q;
+    const int group = params.head_tp_q_per_kv > 1 ? params.head_tp_q_per_kv : 1;
+    const int dp = params.head_tp_dp_size;
+    const int es = static_cast<int>(sizeof(Element));
+    const int dim = params.d;
+    int copied = 0;
+    int publish_token = -1;
+    int publish_q_len = 0;
+    int splice_token = -1;
+    for (int m = 0; m < kBlockM; ++m) {
+        const int idx = bidx * kBlockM + m;
+        if (idx >= span) {
+            break;
+        }
+        const int batch_idx = idx / (params.h * params.seqlen_q);
+        const int rem = idx - batch_idx * params.h * params.seqlen_q;
+        const int head_idx = rem / params.seqlen_q;
+        const int row = rem - head_idx * params.seqlen_q;
+        if (params.head_tp_row_kind[batch_idx] != 1 || head_idx != params.head_tp_kv_begin) {
+            continue;
+        }
+        if (head_tp_is_owner(params, batch_idx)) {
+            if (row == 0) {
+                splice_token = batch_idx;
+            }
+            continue;
+        }
+        int slot = -1;
+        for (int candidate = 1; candidate < dp; ++candidate) {
+            if (params.head_tp_slot_rank[batch_idx * dp + candidate] == params.head_tp_src_rank) {
+                slot = candidate;
+            }
+        }
+        if (slot < 0) {
+            continue;
+        }
+        const int *q_pair = params.head_tp_xchg_q_range + (static_cast<int64_t>(batch_idx) * dp + slot) * 2;
+        const int q_head = head_idx * group + row;
+        if (q_head < q_pair[0] || q_head >= q_pair[1]) {
+            continue;
+        }
+        const int local = q_head - q_pair[0];
+        const int64_t src = head_tp_vec_offset(params, batch_idx, q_head, true) * es;
+        const int64_t dst =
+            ((static_cast<int64_t>(params.head_tp_src_rank) * params.head_tp_payload_tokens + batch_idx) *
+                 params.head_tp_max_q_per +
+             local) *
+            dim * es;
+        const int owner = params.head_tp_slot_rank[batch_idx * dp];
+        char *payload = static_cast<char *>(head_tp_peer(params.head_tp_payload_out_ptrs, owner));
+        const char *out = static_cast<const char *>(params.o_ptr);
+        head_tp_copy(payload + dst, out + src, dim * es, tid, nthreads);
+        copied += 1;
+        publish_token = batch_idx;
+        publish_q_len = q_pair[1] - q_pair[0];
+    }
+    if (copied > 0) {
+        __threadfence_system();
+        __syncthreads();
+        if (tid == 0) {
+            const int owner = params.head_tp_slot_rank[publish_token * dp];
+            int *arrived = static_cast<int *>(head_tp_peer(params.head_tp_arrived_ptrs, owner));
+            const int done = atomicAdd(params.head_tp_return_count + publish_token, copied);
+            if (done + copied == publish_q_len) {
+                head_tp_store_release(
+                    arrived + params.head_tp_src_rank * params.head_tp_payload_tokens + publish_token);
+            }
+        }
+        __syncthreads();
+    }
+    if (splice_token >= 0) {
+        for (int slot = 1; slot < dp; ++slot) {
+            head_tp_owner_splice<Element>(params, splice_token, slot, tid, nthreads);
+        }
     }
 }
 

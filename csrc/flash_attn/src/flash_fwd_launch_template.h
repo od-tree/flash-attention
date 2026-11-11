@@ -124,6 +124,13 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                                     FLASHATTENTION_CUDA_CHECK(cudaFuncSetAttribute(
                                         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
                                 }
+                                if (params.head_tp_num_send_ctas > 0) {
+                                    params.head_tp_grid_x = grid.x;
+                                    params.head_tp_grid_y = grid.y;
+                                    params.head_tp_grid_z = grid.z;
+                                    const int send_blocks = grid.x * grid.y * grid.z + params.head_tp_num_send_ctas;
+                                    grid = dim3(send_blocks, 1, 1);
+                                }
                                 kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
                                 FLASHATTENTION_CUDA_KERNEL_LAUNCH_CHECK();
                             });

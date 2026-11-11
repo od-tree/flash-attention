@@ -535,26 +535,20 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
 
     // Long pages only have kv_per local heads, starting at head_tp_kv_begin.
-    // Idle KV heads on the owner each send one remote slot and splice that
-    // slot back. Every other inactive head returns without writing.
+    // The send CTA is ahead of this grid. Idle heads do not send or wait.
     const int kv_head = bidh / params.h_h_k_ratio;
     const bool long_page = head_tp_long_page(params, bidb);
     const int local_kv = kv_head - params.head_tp_kv_begin;
     const bool tile_active = !long_page || (local_kv >= 0 && local_kv < params.head_tp_kv_per);
     const bool tile_leader = (bidh % params.h_h_k_ratio) == 0 && m_block == 0 && n_split_idx == 0;
-    int send_slot = -1;
-    if (!tile_active && tile_leader) {
-        send_slot = head_tp_owner_send_slot(params, bidb, kv_head);
-    }
-    if (!tile_active && send_slot < 0) {
+    // Sending is a separate CTA ahead of this grid. An idle head must not
+    // wait. Split-KV still has to zero its partial so combine ignores it.
+    if (!tile_active && !Split) {
         return;
     }
-    if (send_slot >= 0) {
-        head_tp_owner_send<Element>(params, bidb, send_slot, tidx, blockDim.x);
-        head_tp_owner_splice<Element>(params, bidb, send_slot, tidx, blockDim.x);
-        return;
+    if (tile_active) {
+        head_tp_partner_prepare<Element>(params, bidb, kv_head, m_block, kBlockM, binfo.actual_seqlen_q, tidx, blockDim.x);
     }
-    head_tp_partner_prepare<Element>(params, bidb, kv_head, m_block, kBlockM, binfo.actual_seqlen_q, tidx, blockDim.x);
     const int page_tokens = head_tp_page_tokens(params, bidb);
     const int kv_slot = head_tp_kv_slot(params, bidb, long_page ? local_kv : kv_head);
 
@@ -567,8 +561,9 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         n_block_max = std::min(n_block_max,
                                cute::ceil_div((m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right, kBlockN));
     }
-    // Empty padding rows write zeros and do not touch KV.
-    if (params.head_tp_row_kind != nullptr && params.head_tp_row_kind[bidb] == 2) {
+    // Empty padding rows write zeros and do not touch KV. An idle split tile
+    // does the same so combine does not read an uninitialized partial.
+    if (!tile_active || (params.head_tp_row_kind != nullptr && params.head_tp_row_kind[bidb] == 2)) {
         n_block_max = n_block_min;
     }
     if (n_block_min >= n_block_max) {  // This also covers the case where n_block_max <= 0
@@ -1123,6 +1118,14 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     if constexpr (!Split) {
         __syncthreads();
         head_tp_partner_return<Element>(params, bidb, bidh, m_block, kBlockM, binfo.actual_seqlen_q, tidx, blockDim.x);
+        // The partner has been computing since the leading send CTA. Waiting
+        // here costs only the slack after this tile's own mainloop.
+        if (tile_leader && tile_active && long_page && local_kv == 0 && head_tp_is_owner(params, bidb)) {
+            const int dp = params.head_tp_dp_size;
+            for (int slot = 1; slot < dp; ++slot) {
+                head_tp_owner_splice<Element>(params, bidb, slot, tidx, blockDim.x);
+            }
+        }
     }
 }
 
@@ -1151,13 +1154,40 @@ inline __device__ void compute_attn(const Params &params) {
 
 template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV, typename Params>
 inline __device__ void compute_attn_splitkv(const Params &params) {
-    const int m_block = blockIdx.x;
-    // The block index for the batch.
-    const int bidb = Split ? blockIdx.z / params.h : blockIdx.y;
-    // The block index for the head.
-    const int bidh = Split ? blockIdx.z - bidb * params.h : blockIdx.z;
-    const int n_split_idx = Split ? blockIdx.y : 0;
-    const int num_n_splits = Split ? gridDim.y : 1;
+    using Element = typename Kernel_traits::Element;
+    int m_block, bidb, bidh, n_split_idx, num_n_splits;
+    if (params.head_tp_num_send_ctas > 0) {
+        const int linear = static_cast<int>(blockIdx.x);
+        if (linear < params.head_tp_num_send_ctas) {
+            head_tp_priority_send<Element>(params, linear, threadIdx.x, blockDim.x);
+            return;
+        }
+        const int gx = params.head_tp_grid_x;
+        const int gy = params.head_tp_grid_y;
+        const int work = linear - params.head_tp_num_send_ctas;
+        m_block = gx > 0 ? work % gx : 0;
+        const int y = (gx > 0 && gy > 0) ? (work / gx) % gy : 0;
+        const int z = (gx > 0 && gy > 0) ? work / (gx * gy) : 0;
+        if constexpr (Split) {
+            bidb = params.h > 0 ? z / params.h : 0;
+            bidh = z - bidb * params.h;
+            n_split_idx = y;
+            num_n_splits = gy > 0 ? gy : 1;
+        } else {
+            bidb = y;
+            bidh = z;
+            n_split_idx = 0;
+            num_n_splits = 1;
+        }
+    } else {
+        m_block = blockIdx.x;
+        // The block index for the batch.
+        bidb = Split ? blockIdx.z / params.h : blockIdx.y;
+        // The block index for the head.
+        bidh = Split ? blockIdx.z - bidb * params.h : blockIdx.z;
+        n_split_idx = Split ? blockIdx.y : 0;
+        num_n_splits = Split ? gridDim.y : 1;
+    }
     FLASH_NAMESPACE::compute_attn_1rowblock_splitkv<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Split, Append_KV>(params, bidb, bidh, m_block, n_split_idx, num_n_splits);
 }
 
@@ -1345,6 +1375,7 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
             }
         }
     }
+    head_tp_after_combine<Element>(params, bidx, kBlockM, tidx, kNThreads);
 }
 
 } // namespace FLASH_NAMESPACE

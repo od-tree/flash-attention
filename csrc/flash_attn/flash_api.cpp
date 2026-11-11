@@ -847,6 +847,9 @@ mha_varlen_fwd(Tensor q,  // total_q x num_heads x head_size, total_q := \sum_{i
         CHECK_SHAPE(xchg_q, batch_size, dp, 2);
         params.head_tp_src_rank = static_cast<int>(head_tp_src_rank);
         params.head_tp_dp_size = dp;
+        // One leading CTA per remote slot of every row. Rows that are not long
+        // or not owned by this rank return immediately.
+        params.head_tp_num_send_ctas = batch_size * (dp > 1 ? dp - 1 : 0);
         params.head_tp_max_q_per = static_cast<int>(head_tp_max_q_per);
         params.head_tp_max_kv_per = static_cast<int>(head_tp_max_kv_per);
         params.head_tp_payload_tokens = static_cast<int>(head_tp_payload_tokens);
@@ -874,10 +877,9 @@ mha_varlen_fwd(Tensor q,  // total_q x num_heads x head_size, total_q := \sum_{i
     // Keep references to these tensors to extend their lifetime
     Tensor softmax_lse_accum, out_accum;
     if (seqlenq_ngroups_swapped) {
-        // Only apply split-k for decoding
-        // Head-TP tiles that do not own a head return without storing. Split-KV
-        // would still combine those heads, so keep a single split.
-        const int head_tp_splits = head_tp_row_kind.has_value() ? 1 : static_cast<int>(num_splits);
+        // Idle head-TP tiles write an empty partial, so split-KV combine skips
+        // them. num_splits == 0 still asks the heuristic to fill the SMs.
+        const int head_tp_splits = static_cast<int>(num_splits);
         std::tie(softmax_lse_accum, out_accum) =
             set_params_splitkv(params, batch_size, num_heads, head_size,
                                max_seqlen_k, max_seqlen_q, head_size_rounded,

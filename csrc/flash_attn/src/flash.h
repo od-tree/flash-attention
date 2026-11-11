@@ -133,6 +133,12 @@ struct Flash_fwd_params : public Qkv_params {
     void * __restrict__ head_tp_payload_k_local = nullptr;
     void * __restrict__ head_tp_payload_v_local = nullptr;
     int * __restrict__ head_tp_return_count = nullptr;
+    // Send CTAs occupy the first linear block ids. They publish Q/K/V and
+    // return; they do not scan KV and they do not wait for the partner.
+    int head_tp_num_send_ctas = 0;
+    int head_tp_grid_x = 0;
+    int head_tp_grid_y = 0;
+    int head_tp_grid_z = 0;
     // Current token K/V for every KV head, [batch, num_kv_heads, dim]. A long
     // page stores only this rank's heads, so the partner's heads are read here.
     void * __restrict__ head_tp_k_token = nullptr;
