@@ -296,12 +296,20 @@ void cp_async_wait() {
 
 // resolves offset of a slice of a paged kv copy from gmem.
 // assumes that the tensor has already been positioned at the correct head.
+// `page_block_size` is the logical page (pack * physical block for a long
+// head-TP row). `physical_block` is k.size(1). A long page stores local head
+// h in slots [h * pack, (h + 1) * pack); the pointer is already at slot
+// h * pack, and the slot delta below walks the rest of that run. A thread's
+// rows stay inside one physical block, so the copy can keep stepping by
+// row_stride after this base address.
 template <typename Kernel_traits>
 __forceinline__ __device__
 int64_t resolve_thread_kv_page_slice_offset(
     const int tidx, const int n_block, const int page_block_size, 
     const int* block_table, const int page_stride, const int row_stride,
-    std::optional<int> partial_block_size = std::nullopt
+    std::optional<int> partial_block_size = std::nullopt,
+    const int64_t physical_block = 0,
+    const int64_t head_stride = 0
 ) {
     constexpr int kGmemThreadsPerRow = Kernel_traits::kGmemThreadsPerRow;
     constexpr int kGmemRowsPerThread = Kernel_traits::kGmemRowsPerThread;
@@ -325,11 +333,15 @@ int64_t resolve_thread_kv_page_slice_offset(
     }
 
     const int64_t global_row_offset = block_row_offset + n_block * kBlockN;
-    const int64_t page_offset = global_row_offset % page_block_size;
+    const int64_t phys = physical_block > 0 ? physical_block : page_block_size;
     const int64_t virtual_page_idx = global_row_offset / page_block_size;
+    const int64_t intra = global_row_offset % page_block_size;
+    const int64_t token = phys == page_block_size ? intra : intra % phys;
+    const int64_t slot_delta = phys == page_block_size ? 0 : intra / phys;
 
     return ((int64_t) block_table[virtual_page_idx]) * ((int64_t) page_stride)
-        + page_offset * ((int64_t) row_stride)
+        + token * ((int64_t) row_stride)
+        + slot_delta * ((int64_t) head_stride)
         + col_offset;
 }
 
