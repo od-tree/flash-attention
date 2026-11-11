@@ -69,7 +69,22 @@ mha_fwd_kvcache(Tensor q,                 // batch_size x seqlen_q x num_heads x
                 int64_t num_splits,
                 std::optional<Tensor> head_tp_row_kind,
                 std::optional<Tensor> head_tp_q_range,
-                int64_t head_tp_dp_size);
+                int64_t head_tp_dp_size,
+                std::optional<Tensor> head_tp_slot_rank,
+                std::optional<Tensor> head_tp_kv_range,
+                std::optional<Tensor> head_tp_xchg_q_range,
+                std::optional<Tensor> head_tp_payload_q_ptrs,
+                std::optional<Tensor> head_tp_payload_k_ptrs,
+                std::optional<Tensor> head_tp_payload_v_ptrs,
+                std::optional<Tensor> head_tp_payload_out_ptrs,
+                std::optional<Tensor> head_tp_arrived_ptrs,
+                std::optional<Tensor> head_tp_arrived_local,
+                std::optional<Tensor> head_tp_payload_out,
+                std::optional<Tensor> head_tp_return_count,
+                int64_t head_tp_src_rank,
+                int64_t head_tp_max_q_per,
+                int64_t head_tp_max_kv_per,
+                int64_t head_tp_payload_tokens);
 
 /////////////////////////// From flash_api_sparse.cpp //////////////////////////
 

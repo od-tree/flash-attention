@@ -145,9 +145,10 @@ def _pointers(buffers, device):
 
 def _repeats(case):
     work = case.num_tokens * max(case.seq_lens())
+    # Long rows dominate the step, so fewer samples still cover the noise.
     if work >= 20 * 8192:
-        return 1, 2
-    return 1, 3
+        return 5, 20
+    return 10, 30
 
 
 def _median(samples):
@@ -400,16 +401,21 @@ def test_two_gpu_decode_step():
             baseline_ms = _sync_wall(step.baseline, warmup, iters)
             head_tp_ms = _sync_wall(step.cooperative, warmup, iters)
             step.check()
+            mismatch = ""
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()
             failures.append(f"{case.name}: out of memory")
             print(f"{case.name:<22} out of memory")
             continue
+        except AssertionError as exc:
+            mismatch = f" check_failed: {exc}"
+            failures.append(f"{case.name}: {exc}")
         ratio = head_tp_ms / baseline_ms if baseline_ms else 0.0
         mark = "yes" if _nanocp(case.name) else ""
         print(
             f"{case.name:<22} {case.num_tokens:6d} {case.long_count:4d} "
-            f"{baseline_ms:12.3f} {head_tp_ms:12.3f} {ratio:8.3f} {mark}"
+            f"{baseline_ms:12.3f} {head_tp_ms:12.3f} {ratio:8.3f} {mark}{mismatch}",
+            flush=True,
         )
         ran += 1
         torch.cuda.empty_cache()

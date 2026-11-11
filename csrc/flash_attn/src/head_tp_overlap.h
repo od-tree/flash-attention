@@ -35,7 +35,7 @@ __device__ __forceinline__ void* head_tp_peer(const int64_t* table, int peer) {
     return reinterpret_cast<void*>(static_cast<uintptr_t>(table[peer]));
 }
 
-__device__ void head_tp_copy(char* dst, const char* src, int nbytes, int tid, int nthreads) {
+__device__ __forceinline__ void head_tp_copy(char* dst, const char* src, int nbytes, int tid, int nthreads) {
     int nvec = nbytes / static_cast<int>(sizeof(uint4));
     const uint4* src4 = reinterpret_cast<const uint4*>(src);
     uint4* dst4 = reinterpret_cast<uint4*>(dst);
@@ -44,7 +44,7 @@ __device__ void head_tp_copy(char* dst, const char* src, int nbytes, int tid, in
     }
 }
 
-__device__ void head_tp_publish(int* flag) {
+__device__ __forceinline__ void head_tp_publish(int* flag) {
     __threadfence_system();
     __syncthreads();
     if (threadIdx.x == 0) {
