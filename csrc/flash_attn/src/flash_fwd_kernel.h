@@ -23,6 +23,8 @@
 #include "mask.h"
 #include "dropout.h"
 #include "rotary.h"
+#include "head_tp_page.h"
+#include "head_tp_exchange.h"
 
 namespace FLASH_NAMESPACE {
 
@@ -532,6 +534,30 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     // if (threadIdx.x == 0 && blockIdx.y == 1 && blockIdx.z == 0) { printf("params.knew_ptr = %p, seqlen_k_cache + seqlen_knew = %d\n", params.knew_ptr, binfo.seqlen_k_cache + (params.knew_ptr == nullptr ? 0 : params.seqlen_knew)); }
     if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
 
+    // Long pages only have kv_per local heads, starting at head_tp_kv_begin.
+    // Idle KV heads on the owner each send one remote slot and splice that
+    // slot back. Every other inactive head returns without writing.
+    const int kv_head = bidh / params.h_h_k_ratio;
+    const bool long_page = head_tp_long_page(params, bidb);
+    const int local_kv = kv_head - params.head_tp_kv_begin;
+    const bool tile_active = !long_page || (local_kv >= 0 && local_kv < params.head_tp_kv_per);
+    const bool tile_leader = (bidh % params.h_h_k_ratio) == 0 && m_block == 0 && n_split_idx == 0;
+    int send_slot = -1;
+    if (!tile_active && tile_leader) {
+        send_slot = head_tp_owner_send_slot(params, bidb, kv_head);
+    }
+    if (!tile_active && send_slot < 0) {
+        return;
+    }
+    if (send_slot >= 0) {
+        head_tp_owner_send<Element>(params, bidb, send_slot, tidx, blockDim.x);
+        head_tp_owner_splice<Element>(params, bidb, send_slot, tidx, blockDim.x);
+        return;
+    }
+    head_tp_partner_prepare<Element>(params, bidb, kv_head, m_block, kBlockM, binfo.actual_seqlen_q, tidx, blockDim.x);
+    const int page_tokens = head_tp_page_tokens(params, bidb);
+    const int kv_slot = head_tp_kv_slot(params, bidb, long_page ? local_kv : kv_head);
+
     const int n_blocks_per_split = ((binfo.actual_seqlen_k + kBlockN - 1) / kBlockN + num_n_splits - 1) / num_n_splits;
     const int n_block_min = !Is_local
         ? n_split_idx * n_blocks_per_split
@@ -540,6 +566,10 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     if (Is_causal || Is_local) {
         n_block_max = std::min(n_block_max,
                                cute::ceil_div((m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right, kBlockN));
+    }
+    // Empty padding rows write zeros and do not touch KV.
+    if (params.head_tp_row_kind != nullptr && params.head_tp_row_kind[bidb] == 2) {
+        n_block_max = n_block_min;
     }
     if (n_block_min >= n_block_max) {  // This also covers the case where n_block_max <= 0
         // We exit early and write 0 to gOaccum and -inf to gLSEaccum.
@@ -591,12 +621,12 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     const int *block_table = params.block_table == nullptr ? nullptr : params.block_table + bidb * params.block_table_batch_stride;
     const index_t row_offset_k = block_table == nullptr
         ? binfo.k_offset(params.k_batch_stride, params.k_row_stride, bidb_cache)
-          + (n_block_max - 1) * kBlockN * params.k_row_stride + (bidh / params.h_h_k_ratio) * params.k_head_stride
-        : (bidh / params.h_h_k_ratio) * params.k_head_stride; // block addresses are later resolved per-thread
+          + (n_block_max - 1) * kBlockN * params.k_row_stride + kv_slot * params.k_head_stride
+        : kv_slot * params.k_head_stride; // block addresses are later resolved per-thread
     const index_t row_offset_v = block_table == nullptr
         ? binfo.k_offset(params.v_batch_stride, params.v_row_stride, bidb_cache)
-          + (n_block_max - 1) * kBlockN * params.v_row_stride + (bidh / params.h_h_k_ratio) * params.v_head_stride
-        : (bidh / params.h_h_k_ratio) * params.v_head_stride;
+          + (n_block_max - 1) * kBlockN * params.v_row_stride + kv_slot * params.v_head_stride
+        : kv_slot * params.v_head_stride;
 
     Tensor mQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.q_ptr) + binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)),
                             make_shape(binfo.actual_seqlen_q, params.h, params.d),
@@ -638,9 +668,9 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
     if (block_table != nullptr) {
         auto final_block_size = binfo.actual_seqlen_k - (n_block_max - 1) * kBlockN;
-        tKgK.data() = gK.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block_max - 1, params.page_block_size,
+        tKgK.data() = gK.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block_max - 1, page_tokens,
             block_table, params.k_batch_stride, params.k_row_stride, final_block_size);
-        tVgV.data() = gV.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block_max - 1, params.page_block_size,
+        tVgV.data() = gV.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block_max - 1, page_tokens,
             block_table, params.v_batch_stride, params.v_row_stride, final_block_size);
     }
 
@@ -798,9 +828,9 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
                 tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
             } else {
                 if (n_block > n_block_copy_min) {
-                    tVgV.data() = gV.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block - 1, params.page_block_size, 
+                    tVgV.data() = gV.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block - 1, page_tokens, 
                         block_table, params.v_batch_stride, params.v_row_stride);
-                    tKgK.data() = gK.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block - 1, params.page_block_size, 
+                    tKgK.data() = gK.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block - 1, page_tokens, 
                         block_table, params.k_batch_stride, params.k_row_stride);
                 }
             }
@@ -894,7 +924,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             if (block_table == nullptr) {
                 tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
             } else {
-                tVgV.data() = gV.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block, params.page_block_size,
+                tVgV.data() = gV.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block, page_tokens,
                     block_table, params.v_batch_stride, params.v_row_stride);
             }
             FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_KV, tVgV, tVsV, tKVcKV, tKVpKV);
@@ -930,7 +960,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             if (block_table == nullptr) {
                 tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
             } else {
-                tKgK.data() = gK.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block - 1, params.page_block_size, 
+                tKgK.data() = gK.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block - 1, page_tokens, 
                     block_table, params.k_batch_stride, params.k_row_stride);
             }
             FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_KV, tKgK, tKsK, tKVcKV, tKVpKV);
@@ -970,7 +1000,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         if (block_table == nullptr) {
             tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
         } else {
-            tVgV.data() = gV.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block, params.page_block_size, 
+            tVgV.data() = gV.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block, page_tokens, 
                 block_table, params.v_batch_stride, params.v_row_stride);
         }
 
@@ -992,7 +1022,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             if (block_table == nullptr) {
                 tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
             } else {
-                tKgK.data() = gK.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block - 1, params.page_block_size, 
+                tKgK.data() = gK.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block - 1, page_tokens, 
                     block_table, params.k_batch_stride, params.k_row_stride);            
             }
             FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_KV, tKgK, tKsK, tKVcKV, tKVpKV);
@@ -1090,6 +1120,10 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
         gmem_tiled_copy_Oaccum, tOrOaccum, tOgOaccum, tOcO, tOpO, binfo.actual_seqlen_q - m_block * kBlockM
     );
+    if constexpr (!Split) {
+        __syncthreads();
+        head_tp_partner_return<Element>(params, bidb, bidh, m_block, kBlockM, binfo.actual_seqlen_q, tidx, blockDim.x);
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

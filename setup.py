@@ -176,6 +176,10 @@ class cmake_build_ext(build_ext):
         # on subsequent calls to python.
         cmake_args += ['-DVLLM_PYTHON_PATH={}'.format(":".join(sys.path))]
 
+        # bf16, head dim 256, paged split kernels only. See CMakeLists.txt.
+        if os.getenv("FA2_MINIMAL_HDIM256_BF16") == "1":
+            cmake_args += ['-DFA2_MINIMAL_HDIM256_BF16=ON']
+
         #
         # Setup parallelism and build tool
         #
@@ -288,7 +292,8 @@ def get_version() -> str:
 
 
 ext_modules.append(CMakeExtension(name="vllm_flash_attn._vllm_fa2_C"))
-ext_modules.append(CMakeExtension(name="vllm_flash_attn._vllm_fa3_C"))
+if os.getenv("FA2_MINIMAL_HDIM256_BF16") != "1":
+    ext_modules.append(CMakeExtension(name="vllm_flash_attn._vllm_fa3_C"))
 
 setup(
     name="vllm-flash-attn",

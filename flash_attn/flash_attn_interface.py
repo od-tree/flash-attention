@@ -164,6 +164,29 @@ def _flash_attn_varlen_forward(
     seqused_k: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
     num_splits: int = 0,
+    head_tp_row_kind: Optional[torch.Tensor] = None,
+    head_tp_pack: int = 0,
+    head_tp_kv_begin: int = 0,
+    head_tp_src_rank: int = -1,
+    head_tp_slot_rank: Optional[torch.Tensor] = None,
+    head_tp_kv_range: Optional[torch.Tensor] = None,
+    head_tp_xchg_q_range: Optional[torch.Tensor] = None,
+    head_tp_k_token: Optional[torch.Tensor] = None,
+    head_tp_v_token: Optional[torch.Tensor] = None,
+    head_tp_payload_q_ptrs: Optional[torch.Tensor] = None,
+    head_tp_payload_k_ptrs: Optional[torch.Tensor] = None,
+    head_tp_payload_v_ptrs: Optional[torch.Tensor] = None,
+    head_tp_payload_out_ptrs: Optional[torch.Tensor] = None,
+    head_tp_arrived_ptrs: Optional[torch.Tensor] = None,
+    head_tp_arrived_local: Optional[torch.Tensor] = None,
+    head_tp_payload_out: Optional[torch.Tensor] = None,
+    head_tp_payload_q: Optional[torch.Tensor] = None,
+    head_tp_payload_k: Optional[torch.Tensor] = None,
+    head_tp_payload_v: Optional[torch.Tensor] = None,
+    head_tp_return_count: Optional[torch.Tensor] = None,
+    head_tp_max_q_per: int = 0,
+    head_tp_max_kv_per: int = 0,
+    head_tp_payload_tokens: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     out, softmax_lse, S_dmask, rng_state = flash_attn_gpu.varlen_fwd(
@@ -189,6 +212,29 @@ def _flash_attn_varlen_forward(
         return_softmax,
         None,  # unused generator slot, kept for backwards-compat arg positioning
         num_splits,
+        head_tp_row_kind,
+        head_tp_pack,
+        head_tp_kv_begin,
+        head_tp_src_rank,
+        head_tp_slot_rank,
+        head_tp_kv_range,
+        head_tp_xchg_q_range,
+        head_tp_k_token,
+        head_tp_v_token,
+        head_tp_payload_q_ptrs,
+        head_tp_payload_k_ptrs,
+        head_tp_payload_v_ptrs,
+        head_tp_payload_out_ptrs,
+        head_tp_arrived_ptrs,
+        head_tp_arrived_local,
+        head_tp_payload_out,
+        head_tp_payload_q,
+        head_tp_payload_k,
+        head_tp_payload_v,
+        head_tp_return_count,
+        head_tp_max_q_per,
+        head_tp_max_kv_per,
+        head_tp_payload_tokens,
     )
     # if out.isnan().any() or softmax_lse.isnan().any():
     #     breakpoint()
@@ -217,7 +263,37 @@ def _flash_attn_varlen_forward_fake(
     seqused_k: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
     num_splits: int = 0,
+    head_tp_row_kind: Optional[torch.Tensor] = None,
+    head_tp_pack: int = 0,
+    head_tp_kv_begin: int = 0,
+    head_tp_src_rank: int = -1,
+    head_tp_slot_rank: Optional[torch.Tensor] = None,
+    head_tp_kv_range: Optional[torch.Tensor] = None,
+    head_tp_xchg_q_range: Optional[torch.Tensor] = None,
+    head_tp_k_token: Optional[torch.Tensor] = None,
+    head_tp_v_token: Optional[torch.Tensor] = None,
+    head_tp_payload_q_ptrs: Optional[torch.Tensor] = None,
+    head_tp_payload_k_ptrs: Optional[torch.Tensor] = None,
+    head_tp_payload_v_ptrs: Optional[torch.Tensor] = None,
+    head_tp_payload_out_ptrs: Optional[torch.Tensor] = None,
+    head_tp_arrived_ptrs: Optional[torch.Tensor] = None,
+    head_tp_arrived_local: Optional[torch.Tensor] = None,
+    head_tp_payload_out: Optional[torch.Tensor] = None,
+    head_tp_payload_q: Optional[torch.Tensor] = None,
+    head_tp_payload_k: Optional[torch.Tensor] = None,
+    head_tp_payload_v: Optional[torch.Tensor] = None,
+    head_tp_return_count: Optional[torch.Tensor] = None,
+    head_tp_max_q_per: int = 0,
+    head_tp_max_kv_per: int = 0,
+    head_tp_payload_tokens: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    del head_tp_row_kind, head_tp_pack, head_tp_kv_begin, head_tp_src_rank
+    del head_tp_slot_rank, head_tp_kv_range, head_tp_xchg_q_range
+    del head_tp_k_token, head_tp_v_token
+    del head_tp_payload_q_ptrs, head_tp_payload_k_ptrs, head_tp_payload_v_ptrs, head_tp_payload_out_ptrs
+    del head_tp_arrived_ptrs, head_tp_arrived_local
+    del head_tp_payload_out, head_tp_payload_q, head_tp_payload_k, head_tp_payload_v, head_tp_return_count
+    del head_tp_max_q_per, head_tp_max_kv_per, head_tp_payload_tokens
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     paged_kv = block_table is not None
     batch_size = cu_seqlens_q.numel() - 1
@@ -924,6 +1000,29 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         return_softmax,
         block_table,
         is_grad_enabled,
+        head_tp_row_kind,
+        head_tp_pack,
+        head_tp_kv_begin,
+        head_tp_src_rank,
+        head_tp_slot_rank,
+        head_tp_kv_range,
+        head_tp_xchg_q_range,
+        head_tp_k_token,
+        head_tp_v_token,
+        head_tp_payload_q_ptrs,
+        head_tp_payload_k_ptrs,
+        head_tp_payload_v_ptrs,
+        head_tp_payload_out_ptrs,
+        head_tp_arrived_ptrs,
+        head_tp_arrived_local,
+        head_tp_payload_out,
+        head_tp_payload_q,
+        head_tp_payload_k,
+        head_tp_payload_v,
+        head_tp_return_count,
+        head_tp_max_q_per,
+        head_tp_max_kv_per,
+        head_tp_payload_tokens,
     ):
         is_grad = is_grad_enabled and any(
             x.requires_grad for x in [q, k, v]
@@ -952,6 +1051,29 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             alibi_slopes=alibi_slopes,
             return_softmax=return_softmax and dropout_p > 0,
             block_table=block_table,
+            head_tp_row_kind=head_tp_row_kind,
+            head_tp_pack=head_tp_pack,
+            head_tp_kv_begin=head_tp_kv_begin,
+            head_tp_src_rank=head_tp_src_rank,
+            head_tp_slot_rank=head_tp_slot_rank,
+            head_tp_kv_range=head_tp_kv_range,
+            head_tp_xchg_q_range=head_tp_xchg_q_range,
+            head_tp_k_token=head_tp_k_token,
+            head_tp_v_token=head_tp_v_token,
+            head_tp_payload_q_ptrs=head_tp_payload_q_ptrs,
+            head_tp_payload_k_ptrs=head_tp_payload_k_ptrs,
+            head_tp_payload_v_ptrs=head_tp_payload_v_ptrs,
+            head_tp_payload_out_ptrs=head_tp_payload_out_ptrs,
+            head_tp_arrived_ptrs=head_tp_arrived_ptrs,
+            head_tp_arrived_local=head_tp_arrived_local,
+            head_tp_payload_out=head_tp_payload_out,
+            head_tp_payload_q=head_tp_payload_q,
+            head_tp_payload_k=head_tp_payload_k,
+            head_tp_payload_v=head_tp_payload_v,
+            head_tp_return_count=head_tp_return_count,
+            head_tp_max_q_per=head_tp_max_q_per,
+            head_tp_max_kv_per=head_tp_max_kv_per,
+            head_tp_payload_tokens=head_tp_payload_tokens,
         )
         if is_grad:
             ctx.save_for_backward(
@@ -1005,7 +1127,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return (dq, dk, dv, *([None] * 37))
 
 
 def flash_attn_qkvpacked_func(
@@ -1397,6 +1519,29 @@ def flash_attn_varlen_func(
     deterministic=False,
     return_attn_probs=False,
     block_table=None,
+    head_tp_row_kind=None,
+    head_tp_pack=0,
+    head_tp_kv_begin=0,
+    head_tp_src_rank=-1,
+    head_tp_slot_rank=None,
+    head_tp_kv_range=None,
+    head_tp_xchg_q_range=None,
+    head_tp_k_token=None,
+    head_tp_v_token=None,
+    head_tp_payload_q_ptrs=None,
+    head_tp_payload_k_ptrs=None,
+    head_tp_payload_v_ptrs=None,
+    head_tp_payload_out_ptrs=None,
+    head_tp_arrived_ptrs=None,
+    head_tp_arrived_local=None,
+    head_tp_payload_out=None,
+    head_tp_payload_q=None,
+    head_tp_payload_k=None,
+    head_tp_payload_v=None,
+    head_tp_return_count=None,
+    head_tp_max_q_per=0,
+    head_tp_max_kv_per=0,
+    head_tp_payload_tokens=0,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -1471,6 +1616,29 @@ def flash_attn_varlen_func(
         return_attn_probs,
         block_table,
         torch.is_grad_enabled(),
+        head_tp_row_kind,
+        head_tp_pack,
+        head_tp_kv_begin,
+        head_tp_src_rank,
+        head_tp_slot_rank,
+        head_tp_kv_range,
+        head_tp_xchg_q_range,
+        head_tp_k_token,
+        head_tp_v_token,
+        head_tp_payload_q_ptrs,
+        head_tp_payload_k_ptrs,
+        head_tp_payload_v_ptrs,
+        head_tp_payload_out_ptrs,
+        head_tp_arrived_ptrs,
+        head_tp_arrived_local,
+        head_tp_payload_out,
+        head_tp_payload_q,
+        head_tp_payload_k,
+        head_tp_payload_v,
+        head_tp_return_count,
+        head_tp_max_q_per,
+        head_tp_max_kv_per,
+        head_tp_payload_tokens,
     )
 
 

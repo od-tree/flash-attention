@@ -286,6 +286,21 @@ void set_params_dgrad(Flash_bwd_params &params,
 }
 
 void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split_kernel=false) {
+#ifdef FA2_MINIMAL_HDIM256_BF16
+    // The test build only instantiates bf16 head dim 256. The switches below
+    // would still reference every other kernel.
+    STD_TORCH_CHECK(params.is_bf16, "This build only supports bf16.");
+    STD_TORCH_CHECK(params.d == 256, "This build only supports head dimension 256.");
+    using elem_type = cutlass::bfloat16_t;
+    constexpr int kHeadDim = 256;
+    BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+        if (params.num_splits <= 1 && !force_split_kernel) {
+            run_mha_fwd_<elem_type, kHeadDim, Is_causal>(params, stream);
+        } else {
+            run_mha_fwd_splitkv_dispatch<elem_type, kHeadDim, Is_causal>(params, stream);
+        }
+    });
+#else
     FP16_SWITCH(!params.is_bf16, [&] {
         HEADDIM_SWITCH(params.d, [&] {
             BOOL_SWITCH(params.is_causal, Is_causal, [&] {
@@ -297,6 +312,7 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
             });
         });
     });
+#endif
 }
 
 // Find the number of splits that maximizes the occupancy. For example, if we have
@@ -583,7 +599,30 @@ mha_varlen_fwd(Tensor q,  // total_q x num_heads x head_size, total_q := \sum_{i
                const bool return_softmax,
                int64_t num_splits,
                // Retained only for backwards-compat arg positioning; must be None.
-               std::optional<Tensor> unused_generator_compat) {
+               std::optional<Tensor> unused_generator_compat,
+               std::optional<Tensor> head_tp_row_kind,
+               int64_t head_tp_pack,
+               int64_t head_tp_kv_begin,
+               int64_t head_tp_src_rank,
+               std::optional<Tensor> head_tp_slot_rank,
+               std::optional<Tensor> head_tp_kv_range,
+               std::optional<Tensor> head_tp_xchg_q_range,
+               std::optional<Tensor> head_tp_k_token,
+               std::optional<Tensor> head_tp_v_token,
+               std::optional<Tensor> head_tp_payload_q_ptrs,
+               std::optional<Tensor> head_tp_payload_k_ptrs,
+               std::optional<Tensor> head_tp_payload_v_ptrs,
+               std::optional<Tensor> head_tp_payload_out_ptrs,
+               std::optional<Tensor> head_tp_arrived_ptrs,
+               std::optional<Tensor> head_tp_arrived_local,
+               std::optional<Tensor> head_tp_payload_out,
+               std::optional<Tensor> head_tp_payload_q,
+               std::optional<Tensor> head_tp_payload_k,
+               std::optional<Tensor> head_tp_payload_v,
+               std::optional<Tensor> head_tp_return_count,
+               int64_t head_tp_max_q_per,
+               int64_t head_tp_max_kv_per,
+               int64_t head_tp_payload_tokens) {
 
     STD_TORCH_CHECK(!unused_generator_compat.has_value(),
                     "flash-attn: the RNG `generator` argument is no longer supported and must be None; "
@@ -627,6 +666,7 @@ mha_varlen_fwd(Tensor q,  // total_q x num_heads x head_size, total_q := \sum_{i
 
     const int batch_size = cu_seqlens_q.numel() - 1;
     int num_heads = sizes[1];
+    const int num_heads_og = num_heads;
     const int head_size = sizes[2];
     const int num_heads_k = paged_KV ? k.size(2) : k.size(1);
 
@@ -752,14 +792,96 @@ mha_varlen_fwd(Tensor q,  // total_q x num_heads x head_size, total_q := \sum_{i
         params.v_batch_stride = v.stride(0);
     }
     params.page_block_size = page_block_size;
+    if (head_tp_row_kind.has_value()) {
+        const Tensor row_kind = head_tp_row_kind.value();
+        STD_TORCH_CHECK(row_kind.scalar_type() == ScalarType::Char, "head_tp_row_kind must be int8");
+        STD_TORCH_CHECK(row_kind.is_cuda(), "head_tp_row_kind must be on CUDA");
+        STD_TORCH_CHECK(row_kind.is_contiguous(), "head_tp_row_kind must be contiguous");
+        CHECK_SHAPE(row_kind, batch_size);
+        STD_TORCH_CHECK(head_tp_pack > 1, "head_tp_pack must be >= 2 when head_tp_row_kind is set");
+        STD_TORCH_CHECK(num_heads_k % head_tp_pack == 0, "head_tp_pack must divide num_kv_heads");
+        params.head_tp_row_kind = static_cast<int8_t *>(row_kind.data_ptr());
+        params.head_tp_pack = static_cast<int>(head_tp_pack);
+        params.head_tp_kv_per = num_heads_k / static_cast<int>(head_tp_pack);
+        STD_TORCH_CHECK(head_tp_kv_begin >= 0 &&
+                            head_tp_kv_begin + params.head_tp_kv_per <= num_heads_k,
+                        "head_tp_kv_begin is outside the KV head range");
+        params.head_tp_kv_begin = static_cast<int>(head_tp_kv_begin);
+        params.head_tp_q_per_kv = ngroups;
+        params.head_tp_num_q_heads = num_heads_og;
+    }
+    if (head_tp_src_rank >= 0) {
+        auto need = [](std::optional<Tensor> &tensor, const char *name) -> Tensor {
+            STD_TORCH_CHECK(tensor.has_value(), name, " is required when head_tp_src_rank >= 0");
+            return tensor.value();
+        };
+        const Tensor slot = need(head_tp_slot_rank, "head_tp_slot_rank");
+        const Tensor kv_range = need(head_tp_kv_range, "head_tp_kv_range");
+        const Tensor xchg_q = need(head_tp_xchg_q_range, "head_tp_xchg_q_range");
+        const Tensor k_token = need(head_tp_k_token, "head_tp_k_token");
+        const Tensor v_token = need(head_tp_v_token, "head_tp_v_token");
+        const Tensor pq = need(head_tp_payload_q_ptrs, "head_tp_payload_q_ptrs");
+        const Tensor pk = need(head_tp_payload_k_ptrs, "head_tp_payload_k_ptrs");
+        const Tensor pv = need(head_tp_payload_v_ptrs, "head_tp_payload_v_ptrs");
+        const Tensor po = need(head_tp_payload_out_ptrs, "head_tp_payload_out_ptrs");
+        const Tensor ap = need(head_tp_arrived_ptrs, "head_tp_arrived_ptrs");
+        const Tensor arrived = need(head_tp_arrived_local, "head_tp_arrived_local");
+        const Tensor payload_out = need(head_tp_payload_out, "head_tp_payload_out");
+        const Tensor payload_q = need(head_tp_payload_q, "head_tp_payload_q");
+        const Tensor payload_k = need(head_tp_payload_k, "head_tp_payload_k");
+        const Tensor payload_v = need(head_tp_payload_v, "head_tp_payload_v");
+        const Tensor ret_count = need(head_tp_return_count, "head_tp_return_count");
+        const int dp = static_cast<int>(slot.size(1));
+        STD_TORCH_CHECK(head_tp_row_kind.has_value(), "head_tp_row_kind is required when head_tp_src_rank >= 0");
+        STD_TORCH_CHECK(dp >= head_tp_pack, "slot_rank must have a column per rank, at least d");
+        STD_TORCH_CHECK(head_tp_max_q_per > 0 && head_tp_max_kv_per > 0 && head_tp_payload_tokens >= batch_size,
+                        "head-TP payload extents must cover this batch");
+        STD_TORCH_CHECK(k_token.scalar_type() == q_dtype && v_token.scalar_type() == q_dtype,
+                        "head_tp_k_token and head_tp_v_token must match q");
+        STD_TORCH_CHECK(k_token.stride(-1) == 1 && v_token.stride(-1) == 1,
+                        "head_tp_k_token and head_tp_v_token must be contiguous in the last dimension");
+        CHECK_SHAPE(k_token, batch_size, num_heads_k, head_size);
+        CHECK_SHAPE(v_token, batch_size, num_heads_k, head_size);
+        CHECK_SHAPE(slot, batch_size, dp);
+        CHECK_SHAPE(kv_range, batch_size, dp, 2);
+        CHECK_SHAPE(xchg_q, batch_size, dp, 2);
+        params.head_tp_src_rank = static_cast<int>(head_tp_src_rank);
+        params.head_tp_dp_size = dp;
+        params.head_tp_max_q_per = static_cast<int>(head_tp_max_q_per);
+        params.head_tp_max_kv_per = static_cast<int>(head_tp_max_kv_per);
+        params.head_tp_payload_tokens = static_cast<int>(head_tp_payload_tokens);
+        params.head_tp_slot_rank = static_cast<int *>(slot.data_ptr());
+        params.head_tp_kv_range = static_cast<int *>(kv_range.data_ptr());
+        params.head_tp_xchg_q_range = static_cast<int *>(xchg_q.data_ptr());
+        params.head_tp_k_token = k_token.data_ptr();
+        params.head_tp_v_token = v_token.data_ptr();
+        params.head_tp_k_token_batch_stride = k_token.stride(0);
+        params.head_tp_k_token_head_stride = k_token.stride(1);
+        params.head_tp_v_token_batch_stride = v_token.stride(0);
+        params.head_tp_v_token_head_stride = v_token.stride(1);
+        params.head_tp_payload_q_ptrs = static_cast<int64_t *>(pq.data_ptr());
+        params.head_tp_payload_k_ptrs = static_cast<int64_t *>(pk.data_ptr());
+        params.head_tp_payload_v_ptrs = static_cast<int64_t *>(pv.data_ptr());
+        params.head_tp_payload_out_ptrs = static_cast<int64_t *>(po.data_ptr());
+        params.head_tp_arrived_ptrs = static_cast<int64_t *>(ap.data_ptr());
+        params.head_tp_arrived_local = static_cast<int *>(arrived.data_ptr());
+        params.head_tp_payload_out_local = payload_out.data_ptr();
+        params.head_tp_payload_q_local = payload_q.data_ptr();
+        params.head_tp_payload_k_local = payload_k.data_ptr();
+        params.head_tp_payload_v_local = payload_v.data_ptr();
+        params.head_tp_return_count = static_cast<int *>(ret_count.data_ptr());
+    }
     // Keep references to these tensors to extend their lifetime
     Tensor softmax_lse_accum, out_accum;
     if (seqlenq_ngroups_swapped) {
         // Only apply split-k for decoding
+        // Head-TP tiles that do not own a head return without storing. Split-KV
+        // would still combine those heads, so keep a single split.
+        const int head_tp_splits = head_tp_row_kind.has_value() ? 1 : static_cast<int>(num_splits);
         std::tie(softmax_lse_accum, out_accum) =
             set_params_splitkv(params, batch_size, num_heads, head_size,
                                max_seqlen_k, max_seqlen_q, head_size_rounded,
-                               p_dropout, num_splits, get_num_sm(get_current_device()), q);
+                               p_dropout, head_tp_splits, get_num_sm(get_current_device()), q);
     } else if (paged_KV) {
         STD_TORCH_CHECK(num_splits <= 1, "num_splits > 1 is not supported for varlen paged KV");
         params.num_splits = num_splits;

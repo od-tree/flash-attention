@@ -7,6 +7,13 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(FA2_ENABLED ON)
 set(FA3_ENABLED ON)
 
+# The set() above is not a cache variable, so -DFA3_ENABLED=OFF does not stick.
+# This option keeps the test build to bf16 head-dim 256 FA2 and turns FA3 off.
+option(FA2_MINIMAL_HDIM256_BF16 "Compile only the bf16 head-dim 256 FA2 kernels" OFF)
+if (FA2_MINIMAL_HDIM256_BF16)
+    set(FA3_ENABLED OFF)
+endif()
+
 # CUDA by default, can be overridden by using -DVLLM_TARGET_DEVICE=... (used by setup.py)
 set(VLLM_TARGET_DEVICE "cuda" CACHE STRING "Target device backend for vLLM")
 
@@ -142,7 +149,23 @@ string(REPLACE "-O2" "-O3" CMAKE_CUDA_FLAGS_RELWITHDEBINFO "${CMAKE_CUDA_FLAGS_R
 #
 
 if (FA2_ENABLED)
-    file(GLOB FA2_GEN_SRCS "csrc/flash_attn/src/flash_fwd_*.cu")
+    if (FA2_MINIMAL_HDIM256_BF16)
+        # Paged varlen forces the split kernel. num_splits == 1 then calls the
+        # align variant, whose symbol is defined in the split_align file and
+        # dispatched from the split file. Causal and non-causal are both
+        # referenced by the runtime switch.
+        set(FA2_GEN_SRCS
+            csrc/flash_attn/src/flash_fwd_hdim256_bf16_sm80.cu
+            csrc/flash_attn/src/flash_fwd_hdim256_bf16_causal_sm80.cu
+            csrc/flash_attn/src/flash_fwd_split_hdim256_bf16_sm80.cu
+            csrc/flash_attn/src/flash_fwd_split_hdim256_bf16_causal_sm80.cu
+            csrc/flash_attn/src/flash_fwd_split_align_hdim256_bf16_sm80.cu
+            csrc/flash_attn/src/flash_fwd_split_align_hdim256_bf16_causal_sm80.cu)
+        set(FA2_SPARSE_API "")
+    else()
+        file(GLOB FA2_GEN_SRCS "csrc/flash_attn/src/flash_fwd_*.cu")
+        set(FA2_SPARSE_API csrc/flash_attn/flash_api_sparse.cpp)
+    endif()
 
     # For CUDA we set the architectures on a per file basis
     if (VLLM_GPU_LANG STREQUAL "CUDA")
@@ -160,7 +183,7 @@ if (FA2_ENABLED)
         LANGUAGE ${VLLM_GPU_LANG}
         SOURCES
             csrc/flash_attn/flash_api.cpp
-            csrc/flash_attn/flash_api_sparse.cpp
+            ${FA2_SPARSE_API}
             csrc/flash_attn/flash_api_torch_lib.cpp
             ${FA2_GEN_SRCS}
         COMPILE_FLAGS ${VLLM_FA_GPU_FLAGS}
@@ -186,6 +209,7 @@ if (FA2_ENABLED)
         USE_CUDA
         # TORCH_TARGET_VERSION pins torch 2.10+ and bans unstable usage
         TORCH_TARGET_VERSION=0x020A000000000000ULL
+        $<$<BOOL:${FA2_MINIMAL_HDIM256_BF16}>:FA2_MINIMAL_HDIM256_BF16=1>
     )
 
     # Pin the C++ standard on the target itself. When flash-attn is built as a

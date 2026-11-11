@@ -41,7 +41,30 @@ mha_varlen_fwd(Tensor q,  // total_q x num_heads x head_size, total_q := \sum_{i
                const bool return_softmax,
                int64_t num_splits,
                // Retained only for backwards-compat arg positioning; must be None.
-               std::optional<Tensor> unused_generator_compat);
+               std::optional<Tensor> unused_generator_compat,
+               std::optional<Tensor> head_tp_row_kind,
+               int64_t head_tp_pack,
+               int64_t head_tp_kv_begin,
+               int64_t head_tp_src_rank,
+               std::optional<Tensor> head_tp_slot_rank,
+               std::optional<Tensor> head_tp_kv_range,
+               std::optional<Tensor> head_tp_xchg_q_range,
+               std::optional<Tensor> head_tp_k_token,
+               std::optional<Tensor> head_tp_v_token,
+               std::optional<Tensor> head_tp_payload_q_ptrs,
+               std::optional<Tensor> head_tp_payload_k_ptrs,
+               std::optional<Tensor> head_tp_payload_v_ptrs,
+               std::optional<Tensor> head_tp_payload_out_ptrs,
+               std::optional<Tensor> head_tp_arrived_ptrs,
+               std::optional<Tensor> head_tp_arrived_local,
+               std::optional<Tensor> head_tp_payload_out,
+               std::optional<Tensor> head_tp_payload_q,
+               std::optional<Tensor> head_tp_payload_k,
+               std::optional<Tensor> head_tp_payload_v,
+               std::optional<Tensor> head_tp_return_count,
+               int64_t head_tp_max_q_per,
+               int64_t head_tp_max_kv_per,
+               int64_t head_tp_payload_tokens);
 
 std::vector<Tensor>
 mha_fwd_kvcache(Tensor q,                 // batch_size x seqlen_q x num_heads x head_size
@@ -119,13 +142,24 @@ STABLE_TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
             "Tensor cu_seqlens_k, Tensor? seqused_k, Tensor? leftpad_k, Tensor? block_table, Tensor? alibi_slopes, "
             "int max_seqlen_q, int max_seqlen_k, float p_dropout, float softmax_scale, bool zero_tensors, "
             "bool is_causal, int window_size_left, int window_size_right, float softcap, bool return_softmax, "
-            "int num_splits, Tensor? gen) -> Tensor[]");
+            "int num_splits, Tensor? gen, Tensor? head_tp_row_kind=None, int head_tp_pack=0, "
+            "int head_tp_kv_begin=0, int head_tp_src_rank=-1, Tensor? head_tp_slot_rank=None, "
+            "Tensor? head_tp_kv_range=None, Tensor? head_tp_xchg_q_range=None, "
+            "Tensor? head_tp_k_token=None, Tensor? head_tp_v_token=None, "
+            "Tensor? head_tp_payload_q_ptrs=None, Tensor? head_tp_payload_k_ptrs=None, "
+            "Tensor? head_tp_payload_v_ptrs=None, Tensor? head_tp_payload_out_ptrs=None, "
+            "Tensor? head_tp_arrived_ptrs=None, Tensor? head_tp_arrived_local=None, "
+            "Tensor? head_tp_payload_out=None, Tensor? head_tp_payload_q=None, "
+            "Tensor? head_tp_payload_k=None, Tensor? head_tp_payload_v=None, "
+            "Tensor? head_tp_return_count=None, "
+            "int head_tp_max_q_per=0, int head_tp_max_kv_per=0, int head_tp_payload_tokens=0) -> Tensor[]");
 
     ops.def("fwd_kvcache(Tensor! q, Tensor kcache, Tensor vcache, Tensor? k, Tensor? v, Tensor? seqlens_k, "
             "Tensor? rotary_cos, Tensor? rotary_sin, Tensor? cache_batch_idx, Tensor? leftpad_k, Tensor? block_table, "
             "Tensor? alibi_slopes, Tensor!? out, float softmax_scale, bool is_causal, int window_size_left, "
             "int window_size_right, float softcap, bool is_rotary_interleaved, int num_splits) -> Tensor[]");
 
+#ifndef FA2_MINIMAL_HDIM256_BF16
     ops.def("fwd_sparse(Tensor! q, Tensor k, Tensor v, "
             "Tensor block_count, Tensor block_offset, Tensor column_count, Tensor column_index, "
             "Tensor!? out, Tensor? alibi_slopes, "
@@ -139,13 +173,16 @@ STABLE_TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
             "Tensor cu_seqlens_k, Tensor? seqused_k, Tensor? alibi_slopes, "
             "int max_seqlen_q, int max_seqlen_k, float p_dropout, float softmax_scale, bool zero_tensors, "
             "bool is_causal, float softcap, bool return_softmax, Tensor? gen) -> Tensor[]");
+#endif
 }
 
 STABLE_TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, CUDA, ops) {
     ops.impl("varlen_fwd", TORCH_BOX(&FLASH_NAMESPACE::mha_varlen_fwd));
     ops.impl("fwd_kvcache", TORCH_BOX(&FLASH_NAMESPACE::mha_fwd_kvcache));
+#ifndef FA2_MINIMAL_HDIM256_BF16
     ops.impl("fwd_sparse", TORCH_BOX(&FLASH_NAMESPACE::mha_fwd_sparse));
     ops.impl("varlen_fwd_sparse", TORCH_BOX(&FLASH_NAMESPACE::mha_varlen_fwd_sparse));
+#endif
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

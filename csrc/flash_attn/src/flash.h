@@ -103,6 +103,45 @@ struct Flash_fwd_params : public Qkv_params {
     index_t block_table_batch_stride;
     int page_block_size;
 
+    // Head-TP paged rows. row_kind 1 packs this rank's kv_per heads into the
+    // physical head slots: local head h occupies slots [h * pack, (h + 1) * pack)
+    // and one physical page holds pack * page_block_size tokens of that head.
+    // pack <= 1 leaves the ordinary page layout unchanged.
+    int8_t * __restrict__ head_tp_row_kind = nullptr;
+    int head_tp_pack = 0;
+    int head_tp_kv_per = 0;
+    // First global KV head owned by this rank. Local head 0 is this index.
+    int head_tp_kv_begin = 0;
+    int head_tp_src_rank = -1;
+    int head_tp_dp_size = 0;
+    int head_tp_num_q_heads = 0;
+    int head_tp_q_per_kv = 1;
+    int head_tp_max_q_per = 0;
+    int head_tp_max_kv_per = 0;
+    int head_tp_payload_tokens = 0;
+    int * __restrict__ head_tp_slot_rank = nullptr;
+    int * __restrict__ head_tp_kv_range = nullptr;
+    int * __restrict__ head_tp_xchg_q_range = nullptr;
+    int64_t * __restrict__ head_tp_payload_q_ptrs = nullptr;
+    int64_t * __restrict__ head_tp_payload_k_ptrs = nullptr;
+    int64_t * __restrict__ head_tp_payload_v_ptrs = nullptr;
+    int64_t * __restrict__ head_tp_payload_out_ptrs = nullptr;
+    int64_t * __restrict__ head_tp_arrived_ptrs = nullptr;
+    int * __restrict__ head_tp_arrived_local = nullptr;
+    void * __restrict__ head_tp_payload_out_local = nullptr;
+    void * __restrict__ head_tp_payload_q_local = nullptr;
+    void * __restrict__ head_tp_payload_k_local = nullptr;
+    void * __restrict__ head_tp_payload_v_local = nullptr;
+    int * __restrict__ head_tp_return_count = nullptr;
+    // Current token K/V for every KV head, [batch, num_kv_heads, dim]. A long
+    // page stores only this rank's heads, so the partner's heads are read here.
+    void * __restrict__ head_tp_k_token = nullptr;
+    void * __restrict__ head_tp_v_token = nullptr;
+    index_t head_tp_k_token_batch_stride = 0;
+    index_t head_tp_k_token_head_stride = 0;
+    index_t head_tp_v_token_batch_stride = 0;
+    index_t head_tp_v_token_head_stride = 0;
+
     // The dropout probability (probability of keeping an activation).
     float p_dropout;
     // uint32_t p_dropout_in_uint;
