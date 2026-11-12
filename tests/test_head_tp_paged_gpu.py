@@ -270,8 +270,12 @@ def _pack_tile(row, head, split):
     return (row & 0xFFFF) | ((head & 0xFF) << 16) | ((split & 0xFF) << 24)
 
 
+# FA2 split-KV kBlockN for head_dim 256. Same rule as flash_api set_params_splitkv.
+KV_TILE = 64
+
+
 def _tile_plan(seqs, n_long, kv_begin, num_sms, device):
-    """Long rows share about num_sms CTAs, capped at 16 splits. Short rows stay at 1.
+    """Long rows share about num_sms CTAs. Cap at 16 and at the KV tile count.
 
     The split count matches vllm.v1.head_tp.build_head_tp_tile_plan.
     """
@@ -284,8 +288,10 @@ def _tile_plan(seqs, n_long, kv_begin, num_sms, device):
     if long_rows and n_long * kv_per < num_sms:
         total = sum(seqs[i] for i in long_rows) or 1
         for i in long_rows:
-            raw = (num_sms * seqs[i]) // (total * kv_per)
-            row_splits[i] = min(16, max(1, raw))
+            seq = max(seqs[i], 1)
+            raw = (num_sms * seq) // (total * kv_per)
+            n_blocks = max(1, (seq + KV_TILE - 1) // KV_TILE)
+            row_splits[i] = min(16, n_blocks, max(1, raw))
     tiles = []
     for row in long_rows:
         for split in range(row_splits[row]):
@@ -572,6 +578,16 @@ def _bf16_ulps(got, ref):
     return (ordered(gi) - ordered(ri)).abs()
 
 
+# Split-KV vs a single walk can differ by about one bf16 step once a sequence
+# spans more than one KV tile. Ordered-code ulps inflate that near zero; the
+# absolute gap stays around 2e-3. Allow one bf16 unit at |x|~1 with slack.
+_MAX_ABS_SPLIT = 4e-3
+
+
+def _max_abs(got, ref):
+    return float((got.float() - ref.float()).abs().max())
+
+
 def _check(case):
     case.base()
     case.s0.synchronize()
@@ -579,18 +595,18 @@ def _check(case):
     case.pack()
     case.cooperative()
     n = case.n_long
-    long_ulps = _bf16_ulps(case.owner_out[:n], ref[:n])
-    if int(long_ulps.max()) > 1:
-        raise AssertionError(f"spliced long rows differ by {int(long_ulps.max())} bf16 ulps")
+    long_abs = _max_abs(case.owner_out[:n], ref[:n])
+    if long_abs > _MAX_ABS_SPLIT:
+        raise AssertionError(f"spliced long rows differ by {long_abs:.3e} abs")
     if case.n > n and not torch.equal(case.owner_out[n:], ref[n:]):
-        local_ulps = int(_bf16_ulps(case.owner_out[n:], ref[n:]).max())
-        raise AssertionError(f"a local row changed ({local_ulps} bf16 ulps)")
+        local_abs = _max_abs(case.owner_out[n:], ref[n:])
+        raise AssertionError(f"a local row changed ({local_abs:.3e} abs)")
     partner = case.partner_out[:n]
     if not torch.equal(partner[:, :Q_PER], torch.zeros_like(partner[:, :Q_PER])):
         raise AssertionError("partner wrote the owner's Q heads")
-    remote_ulps = _bf16_ulps(partner[:, Q_PER:], ref[:n, Q_PER:].to(PARTNER))
-    if int(remote_ulps.max()) > 1:
-        raise AssertionError(f"partner Q heads differ by {int(remote_ulps.max())} bf16 ulps")
+    remote_abs = _max_abs(partner[:, Q_PER:], ref[:n, Q_PER:].to(PARTNER))
+    if remote_abs > _MAX_ABS_SPLIT:
+        raise AssertionError(f"partner Q heads differ by {remote_abs:.3e} abs")
 
 
 def _median(values):
