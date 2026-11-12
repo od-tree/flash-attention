@@ -139,6 +139,14 @@ struct Flash_fwd_params : public Qkv_params {
     int head_tp_grid_x = 0;
     int head_tp_grid_y = 0;
     int head_tp_grid_z = 0;
+    // One packed int per compute CTA, built on the host with the batch.
+    // Bits 0-15 are the row, 16-23 the KV head, 24-31 the split. Send CTAs
+    // are not entries; they remain the leading block ids.
+    int * __restrict__ head_tp_tiles = nullptr;
+    int head_tp_num_tiles = 0;
+    // Per-row split count. Combine reads only this many partials.
+    int8_t * __restrict__ head_tp_row_splits = nullptr;
+    int head_tp_max_splits = 0;
     // Current token K/V for every KV head, [batch, num_kv_heads, dim]. A long
     // page stores only this rank's heads, so the partner's heads are read here.
     void * __restrict__ head_tp_k_token = nullptr;

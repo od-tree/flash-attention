@@ -264,15 +264,56 @@ def _cu(batch, device):
     )
 
 
+def _pack_tile(row, head, split):
+    # Bits 0-15 row, 16-23 KV head, 24-31 split. Same layout as
+    # vllm.v1.head_tp.pack_head_tp_tile.
+    return (row & 0xFFFF) | ((head & 0xFF) << 16) | ((split & 0xFF) << 24)
+
+
+def _tile_plan(seqs, n_long, kv_begin, num_sms, device):
+    """Long rows share about num_sms CTAs, capped at 16 splits. Short rows stay at 1.
+
+    The split count matches vllm.v1.head_tp.build_head_tp_tile_plan.
+    """
+    if os.environ.get("HEAD_TP_TILES", "1") == "0":
+        return None, None, 0
+    n = len(seqs)
+    long_rows = list(range(n_long))
+    kv_per = 1
+    row_splits = [1] * n
+    if long_rows and n_long * kv_per < num_sms:
+        total = sum(seqs[i] for i in long_rows) or 1
+        for i in long_rows:
+            raw = (num_sms * seqs[i]) // (total * kv_per)
+            row_splits[i] = min(16, max(1, raw))
+    tiles = []
+    for row in long_rows:
+        for split in range(row_splits[row]):
+            tiles.append(_pack_tile(row, kv_begin, split))
+    for row in range(n_long, n):
+        for head in range(KV):
+            tiles.append(_pack_tile(row, head, 0))
+    if not tiles:
+        tiles.append(_pack_tile(0, kv_begin, 0))
+        row_splits[0] = 1
+    return (
+        torch.tensor(tiles, dtype=torch.int32, device=device),
+        torch.tensor(row_splits, dtype=torch.int8, device=device),
+        max(row_splits),
+    )
+
+
 def _varlen(ops, q, k, v, block_table, seqused, cu_q, cu_k, max_k, out, row_kind, pack, kv_begin, src, xchg,
-            num_splits=None):
+            num_splits=None, tiles=None, row_splits=None, max_tile_splits=0):
     if num_splits is None:
         num_splits = int(os.environ.get("HEAD_TP_SPLITS", "1"))
-    tail = [None] * 16 if xchg is None else list(xchg)
+    # Sixteen exchange tensors, then max_q / max_kv / payload_tokens. The ints
+    # have C++ defaults, but tiles are positional after them.
+    tail = ([None] * 16 + [0, 0, 0]) if xchg is None else list(xchg)
     ops.varlen_fwd(
         q, k, v, out, cu_q, cu_k, seqused, None, block_table, None,
         1, max_k, 0.0, SCALE, True, False, -1, -1, 0.0, False, num_splits, None,
-        row_kind, pack, kv_begin, src, *tail,
+        row_kind, pack, kv_begin, src, *tail, tiles, row_splits, max_tile_splits,
     )
 
 
@@ -336,6 +377,10 @@ class _Case:
         self.owner_plan = _plan(self.n, n_long, OWNER)
         self.partner_plan = _plan(self.partner_n, n_long, PARTNER)
         self.cu_partner = _cu(self.partner_n, PARTNER)
+        num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+        self.owner_tiles = _tile_plan(self.seqs, n_long, 0, num_sms, OWNER)
+        partner_seqs = self.seqs[:n_long] + self.partner_seqs
+        self.partner_tiles = _tile_plan(partner_seqs, n_long, 1, num_sms, PARTNER)
 
     def pack(self):
         """Build the split caches, then drop the full-head cache."""
@@ -491,9 +536,11 @@ class _Case:
         with torch.cuda.stream(stream):
             if starts is not None:
                 starts[index].record(stream)
+            tiles, row_splits, max_splits = self.owner_tiles if index == 0 else self.partner_tiles
             _varlen(
                 self.ops, q, k, v, table, seqused, *cu, self.max_k, out,
                 row_kind, DEGREE, kv_begin, src, xchg,
+                tiles=tiles, row_splits=row_splits, max_tile_splits=max_splits,
             )
             if ends is not None:
                 ends[index].record(stream)

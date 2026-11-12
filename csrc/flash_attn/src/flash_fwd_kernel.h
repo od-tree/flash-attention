@@ -1156,7 +1156,25 @@ template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, 
 inline __device__ void compute_attn_splitkv(const Params &params) {
     using Element = typename Kernel_traits::Element;
     int m_block, bidb, bidh, n_split_idx, num_n_splits;
-    if (params.head_tp_num_send_ctas > 0) {
+    if (params.head_tp_num_tiles > 0) {
+        // The host tile table is the compute grid. Send CTAs, if any, are a prefix.
+        const int linear = static_cast<int>(blockIdx.x);
+        if (linear < params.head_tp_num_send_ctas) {
+            head_tp_priority_send<Element>(params, linear, threadIdx.x, blockDim.x);
+            return;
+        }
+        const int rec = params.head_tp_tiles[linear - params.head_tp_num_send_ctas];
+        m_block = 0;
+        bidb = rec & 0xffff;
+        bidh = (rec >> 16) & 0xff;
+        n_split_idx = (rec >> 24) & 0xff;
+        num_n_splits = params.head_tp_row_splits != nullptr
+            ? static_cast<int>(params.head_tp_row_splits[bidb])
+            : 1;
+        if (num_n_splits < 1) {
+            num_n_splits = 1;
+        }
+    } else if (params.head_tp_num_send_ctas > 0) {
         const int linear = static_cast<int>(blockIdx.x);
         if (linear < params.head_tp_num_send_ctas) {
             head_tp_priority_send<Element>(params, linear, threadIdx.x, blockDim.x);
@@ -1244,6 +1262,10 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
         const int row = l * kRowsPerLoadLSE + tidx / kBlockM;
         const int col = tidx % kBlockM;
         ElementAccum lse = (row < params.num_splits && col < lse_size - bidx * kBlockM) ? gLSEaccum(row, col) : -INFINITY;
+        if (row < params.num_splits &&
+            !head_tp_partial_used(params, bidx * kBlockM + col, row)) {
+            lse = -INFINITY;
+        }
         if (row < kMaxSplits) { sLSE[row][col] = lse; }
         // if (bidx == 0 && tidx < 32) { printf("tidx = %d, row = %d, col = %d, lse = %f\n", tidx, row, col, lse); }
     }
@@ -1283,13 +1305,16 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     ElementAccum lse_logsum = (lse_sum == 0.f || lse_sum != lse_sum) ? INFINITY : logf(lse_sum) + lse_max;
     // if (bidx == 0 && tidx < 32) { printf("tidx = %d, lse = %f, lse_max = %f, lse_logsum = %f\n", tidx, lse_accum(0), lse_max, lse_logsum); }
     if (tidx % kRowsPerLoadTranspose == 0 && tidx / kRowsPerLoadTranspose < kBlockM) {
-        if (params.unpadded_lse) {
-            const index_t lse_offset = row_offset_lse + tidx / kRowsPerLoadTranspose;
-            if (lse_offset < lse_size) {
-                gLSE_unpadded(lse_offset) = lse_logsum;
+        const int lse_col = tidx / kRowsPerLoadTranspose;
+        if (head_tp_partial_used(params, bidx * kBlockM + lse_col, 0)) {
+            if (params.unpadded_lse) {
+                const index_t lse_offset = row_offset_lse + lse_col;
+                if (lse_offset < lse_size) {
+                    gLSE_unpadded(lse_offset) = lse_logsum;
+                }
+            } else {
+                gLSE(lse_col) = lse_logsum;
             }
-        } else {
-            gLSE(tidx / kRowsPerLoadTranspose) = lse_logsum;
         }
     }
     // Store the scales exp(lse - lse_logsum) in shared memory.
@@ -1335,6 +1360,11 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
         #pragma unroll
         for (int m = 0; m < size<1>(tOrOaccum); ++m) {
             int row = get<0>(tOcOaccum(0, m, 0));
+            // An unwritten partial is uninitialized. A zero scale is not enough:
+            // 0 * NaN is NaN, so skip the row instead of multiplying.
+            if (!head_tp_partial_used(params, bidx * kBlockM + row, split)) {
+                continue;
+            }
             ElementAccum lse_scale = sLSE[split][row];
             #pragma unroll
             for (int k = 0; k < size<2>(tOrOaccum); ++k) {
@@ -1354,7 +1384,8 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     #pragma unroll
     for (int m = 0; m < size<1>(rO); ++m) {
         const int idx = bidx * kBlockM + get<0>(tOcOaccum(0, m, 0));
-        if (idx < params.b * params.h * params.seqlen_q) {
+        if (idx < params.b * params.h * params.seqlen_q &&
+            head_tp_partial_used(params, idx, 0)) {
             const int batch_idx = idx / (params.h * params.seqlen_q);
             const int head_idx = (idx - batch_idx * (params.h * params.seqlen_q)) / params.seqlen_q;
             // The index to the rows of Q

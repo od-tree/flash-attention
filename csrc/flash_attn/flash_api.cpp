@@ -622,7 +622,10 @@ mha_varlen_fwd(Tensor q,  // total_q x num_heads x head_size, total_q := \sum_{i
                std::optional<Tensor> head_tp_return_count,
                int64_t head_tp_max_q_per,
                int64_t head_tp_max_kv_per,
-               int64_t head_tp_payload_tokens) {
+               int64_t head_tp_payload_tokens,
+               std::optional<Tensor> head_tp_tiles,
+               std::optional<Tensor> head_tp_row_splits,
+               int64_t head_tp_max_splits) {
 
     STD_TORCH_CHECK(!unused_generator_compat.has_value(),
                     "flash-attn: the RNG `generator` argument is no longer supported and must be None; "
@@ -874,12 +877,37 @@ mha_varlen_fwd(Tensor q,  // total_q x num_heads x head_size, total_q := \sum_{i
         params.head_tp_payload_v_local = payload_v.data_ptr();
         params.head_tp_return_count = static_cast<int *>(ret_count.data_ptr());
     }
+    if (head_tp_tiles.has_value()) {
+        // The host already chose the CTA list. Do not read it back to recount.
+        STD_TORCH_CHECK(head_tp_row_splits.has_value(),
+                        "head_tp_row_splits is required when head_tp_tiles is set");
+        STD_TORCH_CHECK(head_tp_max_splits >= 1 && head_tp_max_splits <= 128,
+                        "head_tp_max_splits must be in [1, 128]");
+        STD_TORCH_CHECK(max_seqlen_q <= 64,
+                        "head_tp_tiles covers one query tile; seqlen_q must be <= 64");
+        const Tensor tiles = head_tp_tiles.value();
+        const Tensor splits = head_tp_row_splits.value();
+        STD_TORCH_CHECK(tiles.scalar_type() == ScalarType::Int, "head_tp_tiles must be int32");
+        STD_TORCH_CHECK(splits.scalar_type() == ScalarType::Char, "head_tp_row_splits must be int8");
+        STD_TORCH_CHECK(tiles.is_cuda() && splits.is_cuda(), "head-TP tile plan must be on CUDA");
+        STD_TORCH_CHECK(tiles.is_contiguous() && splits.is_contiguous(),
+                        "head-TP tile plan must be contiguous");
+        CHECK_SHAPE(splits, batch_size);
+        params.head_tp_tiles = static_cast<int *>(tiles.data_ptr());
+        params.head_tp_num_tiles = static_cast<int>(tiles.size(0));
+        params.head_tp_row_splits = static_cast<int8_t *>(splits.data_ptr());
+        params.head_tp_max_splits = static_cast<int>(head_tp_max_splits);
+        STD_TORCH_CHECK(seqlenq_ngroups_swapped || params.head_tp_max_splits == 1,
+                        "head_tp_tiles with more than one split require decode GQA");
+    }
     // Keep references to these tensors to extend their lifetime
     Tensor softmax_lse_accum, out_accum;
     if (seqlenq_ngroups_swapped) {
-        // Idle head-TP tiles write an empty partial, so split-KV combine skips
-        // them. num_splits == 0 still asks the heuristic to fill the SMs.
-        const int head_tp_splits = static_cast<int>(num_splits);
+        // A tile plan fixes the split count. Otherwise num_splits == 0 still
+        // asks the heuristic, and idle tiles write an empty partial.
+        const int head_tp_splits = params.head_tp_num_tiles > 0
+            ? params.head_tp_max_splits
+            : static_cast<int>(num_splits);
         std::tie(softmax_lse_accum, out_accum) =
             set_params_splitkv(params, batch_size, num_heads, head_size,
                                max_seqlen_k, max_seqlen_q, head_size_rounded,

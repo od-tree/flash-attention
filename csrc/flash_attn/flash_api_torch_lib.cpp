@@ -64,7 +64,10 @@ mha_varlen_fwd(Tensor q,  // total_q x num_heads x head_size, total_q := \sum_{i
                std::optional<Tensor> head_tp_return_count,
                int64_t head_tp_max_q_per,
                int64_t head_tp_max_kv_per,
-               int64_t head_tp_payload_tokens);
+               int64_t head_tp_payload_tokens,
+               std::optional<Tensor> head_tp_tiles,
+               std::optional<Tensor> head_tp_row_splits,
+               int64_t head_tp_max_splits);
 
 std::vector<Tensor>
 mha_fwd_kvcache(Tensor q,                 // batch_size x seqlen_q x num_heads x head_size
@@ -152,7 +155,9 @@ STABLE_TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
             "Tensor? head_tp_payload_out=None, Tensor? head_tp_payload_q=None, "
             "Tensor? head_tp_payload_k=None, Tensor? head_tp_payload_v=None, "
             "Tensor? head_tp_return_count=None, "
-            "int head_tp_max_q_per=0, int head_tp_max_kv_per=0, int head_tp_payload_tokens=0) -> Tensor[]");
+            "int head_tp_max_q_per=0, int head_tp_max_kv_per=0, int head_tp_payload_tokens=0, "
+            "Tensor? head_tp_tiles=None, Tensor? head_tp_row_splits=None, "
+            "int head_tp_max_splits=0) -> Tensor[]");
 
     ops.def("fwd_kvcache(Tensor! q, Tensor kcache, Tensor vcache, Tensor? k, Tensor? v, Tensor? seqlens_k, "
             "Tensor? rotary_cos, Tensor? rotary_sin, Tensor? cache_batch_idx, Tensor? leftpad_k, Tensor? block_table, "

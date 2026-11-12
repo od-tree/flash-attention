@@ -18,6 +18,29 @@ __device__ __forceinline__ bool head_tp_long_page(const Params &params, int batc
            params.head_tp_row_kind[batch] == 1;
 }
 
+// A combine row owns partial `split` when the host tile table said so.
+// Without a table every partial of params.num_splits is live, as before.
+template <typename Params>
+__device__ __forceinline__ bool head_tp_partial_used(const Params &params, int idx, int split) {
+    if (params.head_tp_row_splits == nullptr) {
+        return true;
+    }
+    const int span = params.b * params.h * params.seqlen_q;
+    if (idx < 0 || idx >= span || params.seqlen_q <= 0) {
+        return false;
+    }
+    const int batch = idx / (params.h * params.seqlen_q);
+    const int rem = idx - batch * params.h * params.seqlen_q;
+    const int head = rem / params.seqlen_q;
+    if (params.head_tp_tiles != nullptr && head_tp_long_page(params, batch)) {
+        const int local = head - params.head_tp_kv_begin;
+        if (local < 0 || local >= params.head_tp_kv_per) {
+            return false;
+        }
+    }
+    return split < static_cast<int>(params.head_tp_row_splits[batch]);
+}
+
 template <typename Params>
 __device__ __forceinline__ int head_tp_page_tokens(const Params &params, int batch) {
     if (!head_tp_long_page(params, batch)) {
