@@ -8,7 +8,9 @@
  * heads do not send and do not spin.
  *
  * The current token's partner K/V is not in this rank's packed page. It is read
- * from head_tp_k_token / head_tp_v_token, one row per request.
+ * from head_tp_k_token / head_tp_v_token, one row per request. Only split 0 of
+ * each local head writes that token into the page. The other splits wait on
+ * head_tp_kv_ready, so a later split cannot read the page mid-copy.
  ******************************************************************************/
 
 #pragma once
@@ -127,6 +129,29 @@ __device__ int64_t head_tp_vec_offset(const Params &params, int token, int q_hea
     return (static_cast<int64_t>(token) * params.head_tp_num_q_heads + q_head) * params.d;
 }
 
+// Later splits spin until each local head's split 0 has published.
+__device__ __forceinline__ void head_tp_wait_count(int *ptr, int expected) {
+    if (expected <= 0) {
+        return;
+    }
+    if (threadIdx.x == 0) {
+        for (uint64_t spin = 0; spin < kHeadTpSpinLimit; ++spin) {
+            const int got = head_tp_load_acquire(ptr);
+            if (got >= expected) {
+                break;
+            }
+            if (spin + 1 == kHeadTpSpinLimit) {
+                printf("head_tp kv ready timeout got=%d expected=%d\n", got, expected);
+                asm volatile("trap;");
+            }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+            __nanosleep(64);
+#endif
+        }
+    }
+    __syncthreads();
+}
+
 template <typename Params>
 __device__ void head_tp_wait_flag(const Params &params, int *flag, int token) {
     if (threadIdx.x == 0) {
@@ -228,7 +253,7 @@ __device__ void head_tp_priority_send(const Params &params, int linear, int tid,
 
 template <typename Element, typename Params>
 __device__ void head_tp_partner_prepare(const Params &params, int token, int kv_head, int m_block, int k_block_m,
-                                       int seqlen_q, int tid, int nthreads) {
+                                       int seqlen_q, int n_split_idx, int tid, int nthreads) {
     if (!head_tp_exchange_on(params) || params.head_tp_row_kind[token] != 1 || params.block_table == nullptr) {
         return;
     }
@@ -257,6 +282,13 @@ __device__ void head_tp_partner_prepare(const Params &params, int token, int kv_
     }
     const int seqlen = head_tp_seqlen(params, token);
     if (seqlen <= 0) {
+        return;
+    }
+    // Every split used to copy this token. Those copies race the split that
+    // has already started reading the page. One CTA per local head writes it.
+    const bool publish = n_split_idx == 0 && m_block == 0;
+    if (params.head_tp_kv_ready != nullptr && !publish) {
+        head_tp_wait_count(params.head_tp_kv_ready + token, params.head_tp_kv_per);
         return;
     }
     const int es = static_cast<int>(sizeof(Element));
@@ -302,6 +334,10 @@ __device__ void head_tp_partner_prepare(const Params &params, int token, int kv_
         }
     }
     __threadfence();
+    __syncthreads();
+    if (params.head_tp_kv_ready != nullptr && tid == 0) {
+        atomicAdd(params.head_tp_kv_ready + token, 1);
+    }
     __syncthreads();
 }
 

@@ -877,6 +877,14 @@ mha_varlen_fwd(Tensor q,  // total_q x num_heads x head_size, total_q := \sum_{i
         params.head_tp_payload_v_local = payload_v.data_ptr();
         params.head_tp_return_count = static_cast<int *>(ret_count.data_ptr());
     }
+    // Lives until this function returns, which is after the launch is queued.
+    // Split 0 publishes here; the other splits wait before touching the page.
+    Tensor head_tp_kv_ready;
+    if (params.head_tp_src_rank >= 0) {
+        head_tp_kv_ready = torch::stable::new_empty(q, {batch_size}, ScalarType::Int);
+        torch::stable::zero_(head_tp_kv_ready);
+        params.head_tp_kv_ready = static_cast<int *>(head_tp_kv_ready.data_ptr());
+    }
     if (head_tp_tiles.has_value()) {
         // The host already chose the CTA list. Do not read it back to recount.
         STD_TORCH_CHECK(head_tp_row_splits.has_value(),

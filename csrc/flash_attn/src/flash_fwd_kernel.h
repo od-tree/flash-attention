@@ -547,7 +547,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         return;
     }
     if (tile_active) {
-        head_tp_partner_prepare<Element>(params, bidb, kv_head, m_block, kBlockM, binfo.actual_seqlen_q, tidx, blockDim.x);
+        head_tp_partner_prepare<Element>(params, bidb, kv_head, m_block, kBlockM, binfo.actual_seqlen_q, n_split_idx, tidx, blockDim.x);
     }
     const int page_tokens = head_tp_page_tokens(params, bidb);
     const int kv_slot = head_tp_kv_slot(params, bidb, long_page ? local_kv : kv_head);
