@@ -312,7 +312,8 @@ def _tile_plan(seqs, n_long, kv_begin, num_sms, device):
 def _varlen(ops, q, k, v, block_table, seqused, cu_q, cu_k, max_k, out, row_kind, pack, kv_begin, src, xchg,
             num_splits=None, tiles=None, row_splits=None, max_tile_splits=0):
     if num_splits is None:
-        num_splits = int(os.environ.get("HEAD_TP_SPLITS", "1"))
+        # 0 asks the FA2 heuristic. The tile path ignores this once a plan is set.
+        num_splits = int(os.environ.get("HEAD_TP_SPLITS", "0"))
     # Sixteen exchange tensors, then max_q / max_kv / payload_tokens. The ints
     # have C++ defaults, but tiles are positional after them.
     tail = ([None] * 16 + [0, 0, 0]) if xchg is None else list(xchg)
@@ -355,7 +356,8 @@ class _Case:
         self.partner_n = n_long + len(self.partner_seqs)
         self.s0 = torch.cuda.Stream(device=OWNER)
         self.s1 = torch.cuda.Stream(device=PARTNER)
-        self.base_splits = int(os.environ.get("HEAD_TP_SPLITS", "1"))
+        # Single-card baseline uses the FA2 heuristic unless HEAD_TP_SPLITS overrides.
+        self.base_splits = int(os.environ.get("HEAD_TP_SPLITS", "0"))
         self.owner_bytes = 0
         k, v, table, spans, q, seqused = _standard_cache(self.seqs, OWNER, 11, fill)
         self.max_k = max(self.seqs)
