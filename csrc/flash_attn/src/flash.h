@@ -140,6 +140,12 @@ struct Flash_fwd_params : public Qkv_params {
     // Send CTAs occupy the first linear block ids. They publish Q/K/V and
     // return; they do not scan KV and they do not wait for the partner.
     int head_tp_num_send_ctas = 0;
+    // 1: device stores stay in the local payload. The host moves that slice
+    // with cudaMemcpyPeer. 0 keeps the peer-VA store.
+    int head_tp_memcpy = 0;
+    // With memcpy: 1 send only, 2 compute without the owner splice, 3 splice.
+    // 0 is the fused peer-store launch.
+    int head_tp_phase = 0;
     int head_tp_grid_x = 0;
     int head_tp_grid_y = 0;
     int head_tp_grid_z = 0;

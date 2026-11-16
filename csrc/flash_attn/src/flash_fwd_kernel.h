@@ -1120,7 +1120,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         head_tp_partner_return<Element>(params, bidb, bidh, m_block, kBlockM, binfo.actual_seqlen_q, tidx, blockDim.x);
         // The partner has been computing since the leading send CTA. Waiting
         // here costs only the slack after this tile's own mainloop.
-        if (tile_leader && tile_active && long_page && local_kv == 0 && head_tp_is_owner(params, bidb)) {
+        if (params.head_tp_phase != 2 && tile_leader && tile_active && long_page && local_kv == 0 &&
+            head_tp_is_owner(params, bidb)) {
             const int dp = params.head_tp_dp_size;
             for (int slot = 1; slot < dp; ++slot) {
                 head_tp_owner_splice<Element>(params, bidb, slot, tidx, blockDim.x);

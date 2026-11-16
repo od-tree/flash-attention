@@ -9,9 +9,10 @@ opened addresses.
 
 Select with ``P2P_BACKEND``:
 
-- ``peer`` — original EnablePeerAccess path
-- ``ipc`` — force CUDA IPC pointer tables
-- ``auto`` (default) — ``ipc`` when any visible GPU is sm_120+ or named 5090
+- ``peer`` — original EnablePeerAccess path, kernel stores to foreign ``data_ptr``
+- ``memcpy`` — ``cudaMemcpyPeer`` for the bytes. Kernel stores stay on the local buffer
+- ``ipc`` — CUDA IPC pointer tables (not usable on this 5090 guest)
+- ``auto`` (default) — ``memcpy`` when any visible GPU is sm_120+ or named 5090
 """
 
 from __future__ import annotations
@@ -53,6 +54,7 @@ def _cudart():
     lib.cudaSetDevice.restype = ctypes.c_int
     lib.cudaDeviceEnablePeerAccess.argtypes = [ctypes.c_int, ctypes.c_uint]
     lib.cudaDeviceEnablePeerAccess.restype = ctypes.c_int
+    lib.cudaGetLastError.restype = ctypes.c_int
     lib.cudaDeviceCanAccessPeer.argtypes = [
         ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int,
     ]
@@ -82,22 +84,26 @@ def _check(err: int, what: str) -> None:
 
 def p2p_backend() -> str:
     raw = os.environ.get("P2P_BACKEND", "auto").strip().lower()
-    if raw in ("peer", "ipc"):
+    if raw in ("peer", "ipc", "memcpy"):
         return raw
     if raw not in ("", "auto"):
-        raise ValueError(f"P2P_BACKEND must be peer, ipc, or auto; got {raw!r}")
+        raise ValueError(f"P2P_BACKEND must be peer, memcpy, ipc, or auto; got {raw!r}")
     if not torch.cuda.is_available():
         return "peer"
     for index in range(torch.cuda.device_count()):
         major, _minor = torch.cuda.get_device_capability(index)
         name = torch.cuda.get_device_name(index)
         if major >= 12 or "5090" in name:
-            return "ipc"
+            return "memcpy"
     return "peer"
 
 
 def use_ipc() -> bool:
     return p2p_backend() == "ipc"
+
+
+def use_memcpy() -> bool:
+    return p2p_backend() == "memcpy"
 
 
 def _cuda_ids(devices: Iterable) -> list[int]:
@@ -118,12 +124,12 @@ def enable_peers(devices, *, backend: str | None = None) -> str:
     """Enable cross-device access. Returns the backend that was selected.
 
     ``peer`` requires EnablePeerAccess success (0 or 704).
-    ``ipc`` still attempts EnablePeerAccess but also accepts 205; kernel stores
-    must then go through :class:`IpcPeerMesh` opened pointers.
+    ``memcpy`` and ``ipc`` also accept 205. ``memcpy`` moves bytes with
+    ``cudaMemcpyPeer`` and does not store through a peer virtual address.
     """
     mode = (backend or p2p_backend()).lower()
-    if mode not in ("peer", "ipc"):
-        raise ValueError(f"backend must be peer or ipc, got {mode!r}")
+    if mode not in ("peer", "ipc", "memcpy"):
+        raise ValueError(f"backend must be peer, memcpy, or ipc, got {mode!r}")
     cuda_ids = _cuda_ids(devices)
     if len(set(cuda_ids)) != len(cuda_ids):
         raise ValueError(f"duplicate CUDA devices in {cuda_ids}")
@@ -157,8 +163,49 @@ def enable_peers(devices, *, backend: str | None = None) -> str:
                     _CUDA_ERROR_MAP_BUFFER_OBJECT_FAILED,
                 ):
                     raise SystemExit(f"peer access {src}->{dst} returned {err}")
+    # 205 is sticky. The next PyTorch call would report it even after a later
+    # cudaMemcpyPeer succeeds, so drop it once the mode has accepted it.
+    lib.cudaGetLastError()
     torch.cuda.set_device(cuda_ids[0])
     return mode
+
+
+def memcpy_peer(dst: torch.Tensor, src: torch.Tensor) -> None:
+    """Copy ``src`` onto ``dst``. Cross-device uses ``cudaMemcpyPeer``.
+
+    Both tensors must be contiguous and the same size. Same-device copies
+    use ``copy_`` so a peer mapping is not required.
+    """
+    if dst.dtype != src.dtype or dst.numel() != src.numel():
+        raise ValueError(
+            f"memcpy_peer shape/dtype {tuple(src.shape)} {src.dtype} -> {tuple(dst.shape)} {dst.dtype}"
+        )
+    if not src.is_contiguous():
+        src = src.contiguous()
+    if not dst.is_contiguous():
+        raise ValueError("memcpy_peer destination must be contiguous")
+    nbytes = src.numel() * src.element_size()
+    if nbytes == 0:
+        return
+    if src.device == dst.device:
+        dst.copy_(src)
+        return
+    if src.device.type != "cuda" or dst.device.type != "cuda":
+        dst.copy_(src)
+        return
+    lib = _cudart()
+    lib.cudaMemcpyPeer.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t,
+    ]
+    lib.cudaMemcpyPeer.restype = ctypes.c_int
+    _check(
+        lib.cudaMemcpyPeer(
+            ctypes.c_void_p(dst.data_ptr()), int(dst.device.index),
+            ctypes.c_void_p(src.data_ptr()), int(src.device.index),
+            ctypes.c_size_t(nbytes),
+        ),
+        "cudaMemcpyPeer",
+    )
 
 
 class IpcPeerMesh:

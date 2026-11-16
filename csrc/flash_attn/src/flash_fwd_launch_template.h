@@ -133,8 +133,23 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                                     const int send_blocks = grid.x * grid.y * grid.z + params.head_tp_num_send_ctas;
                                     grid = dim3(send_blocks, 1, 1);
                                 }
-                                kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
-                                FLASHATTENTION_CUDA_KERNEL_LAUNCH_CHECK();
+                                auto launch_params = params;
+                                auto launch_grid = grid;
+                                if (params.head_tp_memcpy && params.head_tp_phase == 1) {
+                                    launch_params.head_tp_num_tiles = 0;
+                                    launch_grid = dim3(params.head_tp_num_send_ctas > 0 ? params.head_tp_num_send_ctas : 1, 1, 1);
+                                } else if (params.head_tp_memcpy && params.head_tp_phase >= 2) {
+                                    launch_params.head_tp_num_send_ctas = 0;
+                                    if (params.head_tp_num_tiles > 0) {
+                                        launch_grid = dim3(params.head_tp_num_tiles, 1, 1);
+                                    } else if (params.head_tp_grid_x > 0) {
+                                        launch_grid = dim3(params.head_tp_grid_x, params.head_tp_grid_y, params.head_tp_grid_z);
+                                    }
+                                }
+                                if (!(params.head_tp_memcpy && params.head_tp_phase == 1 && params.head_tp_num_send_ctas == 0)) {
+                                    kernel<<<launch_grid, Kernel_traits::kNThreads, smem_size, stream>>>(launch_params);
+                                    FLASHATTENTION_CUDA_KERNEL_LAUNCH_CHECK();
+                                }
                             });
                         });
                     });
