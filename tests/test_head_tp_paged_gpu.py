@@ -9,16 +9,23 @@ shapes are a short batch plus a few 128k or 256k requests. Those do not fit
 if every row is padded to the max length; paged storage does.
 
 ``d = 4`` communication is not run. Two GPUs can only time ``d = 2``.
+
+Peer buffers default to ``EnablePeerAccess`` + foreign ``data_ptr``. On
+sm_120 / RTX 5090 (or ``P2P_BACKEND=ipc``) they use CUDA IPC opened
+pointers instead; see ``cuda_ipc_p2p.py``.
 """
 
-import ctypes
 import importlib.util
 import math
 import os
+import sys
 import time
 from pathlib import Path
 
 import torch
+
+# Allow ``import cuda_ipc_p2p`` when this file is launched by path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 BLOCK = 16
 DEGREE = 2
@@ -48,31 +55,26 @@ def _page_tests():
                 print(f"page {name}.{attr} ok", flush=True)
 
 
+_IPC = None
+
+
 def _enable_peers():
+    """Enable cross-GPU access for the head-TP exchange buffers.
+
+    Default is raw ``EnablePeerAccess`` + foreign ``data_ptr`` (historical).
+    On sm_120 / 5090, or when ``P2P_BACKEND=ipc``, use CUDA IPC opened
+    pointers for kernel stores. See ``cuda_ipc_p2p.py``.
+    """
+    global _IPC
     if torch.cuda.device_count() < 2:
         raise SystemExit("two CUDA devices are required")
-    if not torch.cuda.can_device_access_peer(0, 1) or not torch.cuda.can_device_access_peer(1, 0):
-        raise SystemExit("cuda peer access is not available")
-    lib = None
-    for soname in ("libcudart.so", "libcudart.so.13", "libcudart.so.12"):
-        try:
-            lib = ctypes.CDLL(soname)
-            break
-        except OSError:
-            continue
-    if lib is None:
-        raise SystemExit("libcudart was not found")
-    lib.cudaSetDevice.argtypes = [ctypes.c_int]
-    lib.cudaSetDevice.restype = ctypes.c_int
-    lib.cudaDeviceEnablePeerAccess.argtypes = [ctypes.c_int, ctypes.c_uint]
-    lib.cudaDeviceEnablePeerAccess.restype = ctypes.c_int
-    for src, dst in ((0, 1), (1, 0)):
-        err = lib.cudaSetDevice(src)
-        if err != 0:
-            raise SystemExit(f"cudaSetDevice({src}) returned {err}")
-        err = lib.cudaDeviceEnablePeerAccess(dst, 0)
-        if err not in (0, 704):
-            raise SystemExit(f"peer access {src}->{dst} returned {err}")
+    import cuda_ipc_p2p as ipc
+
+    backend = ipc.enable_peers([0, 1])
+    if backend == "ipc":
+        _IPC = ipc.IpcPeerMesh([0, 1])
+    else:
+        _IPC = None
 
 
 def _ops():
@@ -325,6 +327,9 @@ def _varlen(ops, q, k, v, block_table, seqused, cu_q, cu_k, max_k, out, row_kind
 
 
 def _pointers(buffers, device):
+    if _IPC is not None:
+        writer = device if isinstance(device, int) else device.index
+        return _IPC.pointer_table(list(buffers), int(writer), device=torch.device("cuda", writer))
     return torch.tensor([buf.data_ptr() for buf in buffers], dtype=torch.int64, device=device)
 
 
@@ -477,6 +482,17 @@ class _Case:
             self.k_token_partner[: self.n_long] = k_token[: self.n_long]
             self.v_token_partner[: self.n_long] = v_token[: self.n_long]
         self.payload_tokens = tokens
+        if _IPC is not None:
+            for group in (
+                self.arrived, self.return_count, self.payload_q, self.payload_k,
+                self.payload_v, self.payload_out,
+            ):
+                for tensor in group:
+                    _IPC.export(tensor)
+            _IPC.export(self.k_token)
+            _IPC.export(self.v_token)
+            _IPC.export(self.k_token_partner)
+            _IPC.export(self.v_token_partner)
 
     def _xchg(self, src):
         device = PARTNER if src == PARTNER else OWNER
