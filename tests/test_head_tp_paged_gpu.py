@@ -38,6 +38,19 @@ OWNER = 0
 PARTNER = 1
 DTYPE = torch.bfloat16
 WARMUP = 3
+
+
+def _move(src, device, *, dtype=None):
+    """Cross-GPU copy. PyTorch ``.to()`` fails with error 205 on this 5090."""
+    from cuda_ipc_p2p import copy_tensor
+
+    return copy_tensor(src, device, dtype=dtype)
+
+
+def _put(dst, src):
+    from cuda_ipc_p2p import assign_tensor
+
+    assign_tensor(dst, src)
 ITERS = 8
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -171,8 +184,8 @@ def _split_cache(k, v, table, seqs, n_long, head, device):
     for row, count in enumerate(counts):
         pages_k = _pack_head(_logical_head(k, table[row], seqs[row], head))
         pages_v = _pack_head(_logical_head(v, table[row], seqs[row], head))
-        cache_k[cursor : cursor + count] = pages_k
-        cache_v[cursor : cursor + count] = pages_v
+        _put(cache_k[cursor : cursor + count], pages_k)
+        _put(cache_v[cursor : cursor + count], pages_v)
         cursor += count
     offsets = []
     cursor = 0
@@ -412,7 +425,7 @@ class _Case:
         partner_k, partner_v, partner_table = _split_cache(
             k, v, table, self.seqs, self.n_long, head=1, device=PARTNER
         )
-        partner_seq = seqused[: self.n_long].to(PARTNER)
+        partner_seq = _move(seqused[: self.n_long], PARTNER)
         partner_q = torch.zeros(self.partner_n, Q, DIM, dtype=DTYPE, device=PARTNER)
         if self.partner_base is not None:
             pq, pk, pv, _, pseq = self.partner_base
@@ -445,7 +458,7 @@ class _Case:
         owner_k, owner_v, owner_table = _random_pages(self.seqs, self.n_long, OWNER)
         partner_seqs = self.seqs[: self.n_long]
         partner_k, partner_v, partner_table = _random_pages(partner_seqs, self.n_long, PARTNER)
-        partner_seq = seqused[: self.n_long].to(PARTNER)
+        partner_seq = _move(seqused[: self.n_long], PARTNER)
         partner_q = torch.empty(self.partner_n, Q, DIM, dtype=DTYPE, device=PARTNER)
         k_token = torch.empty(self.n, KV, DIM, dtype=DTYPE, device=OWNER)
         v_token = torch.empty(self.n, KV, DIM, dtype=DTYPE, device=OWNER)
@@ -486,11 +499,22 @@ class _Case:
         self.k_token_partner = torch.zeros(self.partner_n, KV, DIM, dtype=DTYPE, device=PARTNER)
         self.v_token_partner = torch.zeros(self.partner_n, KV, DIM, dtype=DTYPE, device=PARTNER)
         if self.n_long:
-            self.k_token_partner[: self.n_long] = k_token[: self.n_long]
-            self.v_token_partner[: self.n_long] = v_token[: self.n_long]
+            _put(self.k_token_partner[: self.n_long], k_token[: self.n_long])
+            _put(self.v_token_partner[: self.n_long], v_token[: self.n_long])
         self.payload_tokens = tokens
 
     def _xchg(self, src):
+        # The pointer tables are invariant. Building them inside a capture is a
+        # pageable host copy, which CUDA graph rejects.
+        cached = getattr(self, "_xchg_cache", None)
+        if cached is None:
+            cached = {}
+            self._xchg_cache = cached
+        if src not in cached:
+            cached[src] = self._xchg_build(src)
+        return cached[src]
+
+    def _xchg_build(self, src):
         device = PARTNER if src == PARTNER else OWNER
         plan = self.partner_plan if src == PARTNER else self.owner_plan
         _, slot, kv_range, q_range = plan
@@ -553,18 +577,30 @@ class _Case:
         # Send writes a local plane. Compute waits on that plane. The return
         # is copied before the owner splice, which is a third launch.
         planes = (self.payload_q, self.payload_k, self.payload_v, self.arrived)
+        from cuda_ipc_p2p import graph_streams_active
+
+        graphing = graph_streams_active()
+        if graphing:
+            with torch.cuda.stream(self.s0):
+                self.arrived[0].zero_()
+                self.return_count[0].zero_()
+            with torch.cuda.stream(self.s1):
+                self.arrived[1].zero_()
+                self.return_count[1].zero_()
         os.environ["HEAD_TP_PHASE"] = "send"
         self._launch(self.s0, self.owner, self.owner_out, self.owner_plan, 0, OWNER, self._xchg(OWNER), starts, None, 0)
         self._launch(self.s1, self.partner, self.partner_out, self.partner_plan, 1, PARTNER, self._xchg(PARTNER), starts, None, 1)
-        self.s0.synchronize()
-        self.s1.synchronize()
+        if not graphing:
+            self.s0.synchronize()
+            self.s1.synchronize()
         for src in (OWNER, PARTNER):
             _copy_rank_plane(planes, src)
         os.environ["HEAD_TP_PHASE"] = "compute"
         self._launch(self.s0, self.owner, self.owner_out, self.owner_plan, 0, OWNER, self._xchg(OWNER), None, None, 0)
         self._launch(self.s1, self.partner, self.partner_out, self.partner_plan, 1, PARTNER, self._xchg(PARTNER), None, None, 1)
-        self.s0.synchronize()
-        self.s1.synchronize()
+        if not graphing:
+            self.s0.synchronize()
+            self.s1.synchronize()
         for src in (OWNER, PARTNER):
             _copy_rank_plane((self.payload_out, self.arrived), src)
         os.environ["HEAD_TP_PHASE"] = "splice"
@@ -641,7 +677,7 @@ def _check(case):
     partner = case.partner_out[:n]
     if not torch.equal(partner[:, :Q_PER], torch.zeros_like(partner[:, :Q_PER])):
         raise AssertionError("partner wrote the owner's Q heads")
-    remote_abs = _max_abs(partner[:, Q_PER:], ref[:n, Q_PER:].to(PARTNER))
+    remote_abs = _max_abs(partner[:, Q_PER:], _move(ref[:n, Q_PER:], PARTNER))
     if remote_abs > _MAX_ABS_SPLIT:
         raise AssertionError(f"partner Q heads differ by {remote_abs:.3e} abs")
 
@@ -703,23 +739,23 @@ def _report(name, base_ev, base_wall, split_ev, split_wall, std_ev, std_wall, pa
     )
 
 
+def _graph_wall(work, streams):
+    """One CUDA graph for the step. The number is the replay's GPU time."""
+    from cuda_ipc_p2p import capture_graph, replay_median
+
+    graph = capture_graph(streams, work)
+    return replay_median(graph, streams[0], ITERS)
+
+
 def _perf(case):
     base_streams = [case.s0] if case.partner_base is None else [case.s0, case.s1]
-    base_ev, base_wall = _time(
-        lambda starts, ends: case.base(starts, ends),
-        base_streams,
-    )
+    base_wall = _graph_wall(lambda: case.base(None, None), base_streams)
     case.pack()
-    split_ev, split_wall = _time(
-        lambda starts, ends: case._split_timed(starts, ends),
-        [case.s0, case.s1],
-    )
-    std_ev, std_wall = _time(
-        lambda starts, ends: case._std_timed(starts, ends),
-        [case.s0, case.s1],
-        before=case.clear_flags,
-    )
-    return base_ev, base_wall, split_ev, split_wall, std_ev, std_wall, case.paged_bytes, _dense_bytes(case.seqs)
+    split_wall = _graph_wall(lambda: case._split_timed(None, None), [case.s0, case.s1])
+    # Flags are cleared inside the captured exchange. An eager clear would sit
+    # outside the graph and would not rerun on replay.
+    std_wall = _graph_wall(lambda: case._std_timed(None, None), [case.s0, case.s1])
+    return [base_wall], base_wall, [split_wall], split_wall, [std_wall], std_wall, case.paged_bytes, _dense_bytes(case.seqs)
 
 
 def _run_named(ops, name, seqs, n_long, check, partner_seqs=None):

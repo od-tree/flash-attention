@@ -157,7 +157,9 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
             });
         });
     });
-    if (params.num_splits > 1) {
+    // Phase 1 only publishes the local send. The combine kernel splices, and
+    // that wait cannot succeed until the host has copied the return flag.
+    if (params.num_splits > 1 && !(params.head_tp_memcpy && params.head_tp_phase == 1)) {
         // We want kBlockM to be as small as possible for more parallelism.
         // With 128 threads we can load 512 elements at a time, so if headdim is divisible by 128, kBlockM = 4.
         // If headdim is divisible by 64, then we set kBlockM = 8, etc.

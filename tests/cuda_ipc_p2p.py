@@ -170,6 +170,125 @@ def enable_peers(devices, *, backend: str | None = None) -> str:
     return mode
 
 
+# Device index -> stream. Set only while a CUDA graph is being captured.
+# Copies then become stream-ordered cudaMemcpyAsync nodes. cudaMemcpyPeerAsync
+# itself returns "not permitted when stream is capturing" on this driver.
+_GRAPH_STREAMS: dict[int, torch.cuda.Stream] = {}
+
+
+def graph_streams_active() -> bool:
+    return bool(_GRAPH_STREAMS)
+
+
+class use_graph_streams:
+    """Route peer copies onto these streams for the duration of a capture."""
+
+    def __init__(self, streams):
+        self.streams = {int(stream.device.index): stream for stream in streams}
+        self._prev: dict[int, torch.cuda.Stream] = {}
+
+    def __enter__(self):
+        global _GRAPH_STREAMS
+        self._prev = _GRAPH_STREAMS
+        _GRAPH_STREAMS = self.streams
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        global _GRAPH_STREAMS
+        _GRAPH_STREAMS = self._prev
+        return False
+
+
+def fork_graph_streams(root: torch.cuda.Stream) -> None:
+    """Let the other devices join this capture without waiting for ``root``'s later work."""
+    if len(_GRAPH_STREAMS) < 2:
+        return
+    event = root.record_event()
+    for stream in _GRAPH_STREAMS.values():
+        if stream is not root:
+            stream.wait_event(event)
+
+
+def capture_graph(streams, work):
+    """Warm ``work`` once, then capture it.
+
+    Timing events stay outside the graph. Events recorded inside a capture
+    cannot be queried with ``elapsed_time`` on this driver (invalid argument).
+    Replaying on the root stream still includes the other GPU, because the
+    capture joins that stream back before the graph ends.
+    """
+    work()
+    torch.cuda.synchronize()
+    root = streams[0]
+    for stream in streams[1:]:
+        torch.cuda.set_device(stream.device)
+        torch.cuda.set_stream(stream)
+    torch.cuda.set_device(root.device)
+    root.wait_stream(torch.cuda.current_stream(root.device))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(root):
+        with torch.cuda.graph(graph, stream=root):
+            with use_graph_streams(streams):
+                fork_graph_streams(root)
+                work()
+                join_graph_streams(root)
+    torch.cuda.current_stream(root.device).wait_stream(root)
+    torch.cuda.set_device(root.device)
+    return graph
+
+
+def replay_median(graph, root, rounds: int) -> float:
+    wall0 = torch.cuda.Event(True)
+    wall1 = torch.cuda.Event(True)
+    samples = []
+    for _ in range(rounds):
+        with torch.cuda.stream(root):
+            wall0.record(root)
+            graph.replay()
+            wall1.record(root)
+        wall1.synchronize()
+        samples.append(wall0.elapsed_time(wall1))
+    samples.sort()
+    return samples[len(samples) // 2]
+
+
+def join_graph_streams(root: torch.cuda.Stream) -> None:
+    """Make ``root`` wait until every other captured stream has finished."""
+    for stream in _GRAPH_STREAMS.values():
+        if stream is not root:
+            root.wait_event(stream.record_event())
+
+
+def _memcpy_async(dst: torch.Tensor, src: torch.Tensor) -> None:
+    """Device-to-device copy on the source stream. Peer pointers are allowed.
+
+    The destination stream waits for that copy, so a later kernel there sees
+    the bytes. This form is capturable; ``cudaMemcpyPeerAsync`` is not.
+    """
+    src_stream = _GRAPH_STREAMS[int(src.device.index)]
+    dst_stream = _GRAPH_STREAMS[int(dst.device.index)]
+    if src.device == dst.device:
+        with torch.cuda.stream(src_stream):
+            dst.copy_(src)
+        return
+    lib = _cudart()
+    lib.cudaMemcpyAsync.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p,
+    ]
+    lib.cudaMemcpyAsync.restype = ctypes.c_int
+    nbytes = src.numel() * src.element_size()
+    _check(
+        lib.cudaMemcpyAsync(
+            ctypes.c_void_p(dst.data_ptr()), ctypes.c_void_p(src.data_ptr()),
+            ctypes.c_size_t(nbytes), ctypes.c_int(3),  # cudaMemcpyDeviceToDevice
+            ctypes.c_void_p(src_stream.cuda_stream),
+        ),
+        "cudaMemcpyAsync",
+    )
+    if dst_stream is not src_stream:
+        dst_stream.wait_event(src_stream.record_event())
+
+
 def memcpy_peer(dst: torch.Tensor, src: torch.Tensor) -> None:
     """Copy ``src`` onto ``dst``. Cross-device uses ``cudaMemcpyPeer``.
 
@@ -186,6 +305,9 @@ def memcpy_peer(dst: torch.Tensor, src: torch.Tensor) -> None:
         raise ValueError("memcpy_peer destination must be contiguous")
     nbytes = src.numel() * src.element_size()
     if nbytes == 0:
+        return
+    if _GRAPH_STREAMS:
+        _memcpy_async(dst, src)
         return
     if src.device == dst.device:
         dst.copy_(src)
@@ -206,6 +328,47 @@ def memcpy_peer(dst: torch.Tensor, src: torch.Tensor) -> None:
         ),
         "cudaMemcpyPeer",
     )
+
+
+def _as_device(device) -> torch.device:
+    if isinstance(device, int):
+        return torch.device("cuda", device)
+    return torch.device(device)
+
+
+def copy_tensor(src: torch.Tensor, device, *, dtype: torch.dtype | None = None) -> torch.Tensor:
+    """Move ``src`` to ``device``. Cross-GPU on the memcpy backend uses ``cudaMemcpyPeer``.
+
+    PyTorch ``.to()`` between these two 5090s returns
+    ``cudaErrorMapBufferObjectFailed``. Same-device and CPU copies stay on ``.to()``.
+    """
+    if dtype is not None and src.dtype != dtype:
+        src = src.to(dtype=dtype)
+    target = _as_device(device)
+    if src.device == target:
+        return src
+    if src.device.type == "cpu" and target.type == "cuda" and torch.cuda.is_current_stream_capturing():
+        # A pageable H2D copy cannot be captured. Pinning is host-side.
+        src = src.pin_memory()
+        return src.to(target, non_blocking=True)
+    if not (src.is_cuda and target.type == "cuda" and use_memcpy()):
+        return src.to(target)
+    packed = src.contiguous()
+    dst = torch.empty(packed.shape, dtype=packed.dtype, device=target)
+    memcpy_peer(dst, packed)
+    return dst
+
+
+def assign_tensor(dst: torch.Tensor, src: torch.Tensor) -> None:
+    """Write ``src`` into ``dst``. Cross-GPU on the memcpy backend uses ``cudaMemcpyPeer``."""
+    if dst.shape != src.shape or dst.dtype != src.dtype:
+        raise ValueError(
+            f"assign_tensor shape/dtype {tuple(src.shape)} {src.dtype} -> {tuple(dst.shape)} {dst.dtype}"
+        )
+    if dst.device == src.device or not (dst.is_cuda and src.is_cuda and use_memcpy()):
+        dst.copy_(src)
+        return
+    memcpy_peer(dst, src)
 
 
 class IpcPeerMesh:

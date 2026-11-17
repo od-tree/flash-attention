@@ -545,7 +545,7 @@ __device__ void head_tp_after_combine(const Params &params, int bidx, int kBlock
         }
         __syncthreads();
     }
-    if (splice_token >= 0 && params.head_tp_phase != 2) {
+    if (splice_token >= 0 && (params.head_tp_phase == 0 || params.head_tp_phase == 3)) {
         for (int slot = 1; slot < dp; ++slot) {
             head_tp_owner_splice<Element>(params, splice_token, slot, tid, nthreads);
         }
