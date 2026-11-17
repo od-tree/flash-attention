@@ -274,10 +274,27 @@ def _pack_tile(row, head, split):
 KV_TILE = 64
 
 
+def _splits_for_full_waves(long_heads, num_sms, cap):
+    """Match ``vllm.v1.head_tp._splits_for_full_waves``."""
+    if long_heads <= 0 or num_sms <= 0:
+        return 1
+    cap = max(1, cap)
+    best_splits = 1
+    best_waves = (long_heads + num_sms - 1) // num_sms
+    for splits in range(2, cap + 1):
+        waves = (long_heads * splits + num_sms - 1) // num_sms
+        if waves * best_splits < best_waves * splits:
+            best_splits = splits
+            best_waves = waves
+    return best_splits
+
+
 def _tile_plan(seqs, n_long, kv_begin, num_sms, device):
     """Long rows share about num_sms CTAs. Cap at 16 and at the KV tile count.
 
-    The split count matches vllm.v1.head_tp.build_head_tp_tile_plan.
+    A full batch that already fills the SMs is split again to shorten the
+    partial last wave. The split count matches
+    vllm.v1.head_tp.build_head_tp_tile_plan.
     """
     if os.environ.get("HEAD_TP_TILES", "1") == "0":
         return None, None, 0
@@ -285,13 +302,23 @@ def _tile_plan(seqs, n_long, kv_begin, num_sms, device):
     long_rows = list(range(n_long))
     kv_per = 1
     row_splits = [1] * n
-    if long_rows and n_long * kv_per < num_sms:
+    long_heads = n_long * kv_per
+    if long_rows and long_heads < num_sms:
         total = sum(seqs[i] for i in long_rows) or 1
         for i in long_rows:
             seq = max(seqs[i], 1)
             raw = (num_sms * seq) // (total * kv_per)
             n_blocks = max(1, (seq + KV_TILE - 1) // KV_TILE)
             row_splits[i] = min(16, n_blocks, max(1, raw))
+    elif long_rows:
+        max_seq = max(max(seqs[i], 1) for i in long_rows)
+        max_blocks = max(1, (max_seq + KV_TILE - 1) // KV_TILE)
+        chosen = _splits_for_full_waves(long_heads, num_sms, min(16, max_blocks))
+        for i in long_rows:
+            seq = max(seqs[i], 1)
+            n_blocks = max(1, (seq + KV_TILE - 1) // KV_TILE)
+            raw = max(1, chosen * seq // max_seq)
+            row_splits[i] = min(16, n_blocks, raw)
     tiles = []
     for row in long_rows:
         for split in range(row_splits[row]):
