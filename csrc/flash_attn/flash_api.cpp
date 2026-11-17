@@ -16,8 +16,6 @@
 
 #include <cstdint>
 #include <cmath>
-#include <cstdlib>
-#include <cstring>
 #include <limits>
 #include <optional>
 #include <tuple>
@@ -855,24 +853,6 @@ mha_varlen_fwd(Tensor q,  // total_q x num_heads x head_size, total_q := \sum_{i
         // One leading CTA per remote slot of every row. Rows that are not long
         // or not owned by this rank return immediately.
         params.head_tp_num_send_ctas = batch_size * (dp > 1 ? dp - 1 : 0);
-        params.head_tp_memcpy = 0;
-        params.head_tp_phase = 0;
-        if (const char *backend = std::getenv("P2P_BACKEND")) {
-            if (std::strcmp(backend, "memcpy") == 0) {
-                params.head_tp_memcpy = 1;
-            }
-        }
-        if (params.head_tp_memcpy) {
-            if (const char *phase = std::getenv("HEAD_TP_PHASE")) {
-                if (std::strcmp(phase, "send") == 0) {
-                    params.head_tp_phase = 1;
-                } else if (std::strcmp(phase, "compute") == 0) {
-                    params.head_tp_phase = 2;
-                } else if (std::strcmp(phase, "splice") == 0) {
-                    params.head_tp_phase = 3;
-                }
-            }
-        }
         params.head_tp_max_q_per = static_cast<int>(head_tp_max_q_per);
         params.head_tp_max_kv_per = static_cast<int>(head_tp_max_kv_per);
         params.head_tp_payload_tokens = static_cast<int>(head_tp_payload_tokens);

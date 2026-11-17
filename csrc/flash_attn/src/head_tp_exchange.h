@@ -41,17 +41,6 @@ __device__ __forceinline__ void *head_tp_peer(const int64_t *table, int peer) {
     return reinterpret_cast<void *>(static_cast<uintptr_t>(table[peer]));
 }
 
-// Memcpy transport writes the local payload. The host cudaMemcpyPeer moves
-// that slice onto the peer and publishes the flag before the next phase.
-template <typename Params>
-__device__ __forceinline__ void *head_tp_remote_or_local(const Params &params, const int64_t *table, void *local,
-                                                         int peer) {
-    if (params.head_tp_memcpy) {
-        return local;
-    }
-    return head_tp_peer(table, peer);
-}
-
 __device__ __forceinline__ void head_tp_copy(char *dst, const char *src, int nbytes, int tid, int nthreads) {
     const int nvec = nbytes / static_cast<int>(sizeof(uint4));
     const uint4 *src4 = reinterpret_cast<const uint4 *>(src);
@@ -195,14 +184,10 @@ __device__ void head_tp_owner_send(const Params &params, int token, int slot, in
     }
     const int es = static_cast<int>(sizeof(Element));
     const int dim = params.d;
-    char *payload_q = static_cast<char *>(
-        head_tp_remote_or_local(params, params.head_tp_payload_q_ptrs, params.head_tp_payload_q_local, dst));
-    char *payload_k = static_cast<char *>(
-        head_tp_remote_or_local(params, params.head_tp_payload_k_ptrs, params.head_tp_payload_k_local, dst));
-    char *payload_v = static_cast<char *>(
-        head_tp_remote_or_local(params, params.head_tp_payload_v_ptrs, params.head_tp_payload_v_local, dst));
-    int *arrived = static_cast<int *>(
-        head_tp_remote_or_local(params, params.head_tp_arrived_ptrs, params.head_tp_arrived_local, dst));
+    char *payload_q = static_cast<char *>(head_tp_peer(params.head_tp_payload_q_ptrs, dst));
+    char *payload_k = static_cast<char *>(head_tp_peer(params.head_tp_payload_k_ptrs, dst));
+    char *payload_v = static_cast<char *>(head_tp_peer(params.head_tp_payload_v_ptrs, dst));
+    int *arrived = static_cast<int *>(head_tp_peer(params.head_tp_arrived_ptrs, dst));
     const char *q = static_cast<const char *>(params.q_ptr);
     const char *k = static_cast<const char *>(params.head_tp_k_token);
     const char *v = static_cast<const char *>(params.head_tp_v_token);
@@ -383,10 +368,8 @@ __device__ void head_tp_partner_return(const Params &params, int token, int bidh
     const int es = static_cast<int>(sizeof(Element));
     const int dim = params.d;
     const char *out = static_cast<const char *>(params.o_ptr);
-    char *payload = static_cast<char *>(
-        head_tp_remote_or_local(params, params.head_tp_payload_out_ptrs, params.head_tp_payload_out_local, owner));
-    int *arrived = static_cast<int *>(
-        head_tp_remote_or_local(params, params.head_tp_arrived_ptrs, params.head_tp_arrived_local, owner));
+    char *payload = static_cast<char *>(head_tp_peer(params.head_tp_payload_out_ptrs, owner));
+    int *arrived = static_cast<int *>(head_tp_peer(params.head_tp_arrived_ptrs, owner));
     const int group = params.head_tp_q_per_kv > 1 ? params.head_tp_q_per_kv : 1;
     int copied = 0;
     if (params.seqlenq_ngroups_swapped) {
@@ -522,8 +505,7 @@ __device__ void head_tp_after_combine(const Params &params, int bidx, int kBlock
              local) *
             dim * es;
         const int owner = params.head_tp_slot_rank[batch_idx * dp];
-        char *payload = static_cast<char *>(
-            head_tp_remote_or_local(params, params.head_tp_payload_out_ptrs, params.head_tp_payload_out_local, owner));
+        char *payload = static_cast<char *>(head_tp_peer(params.head_tp_payload_out_ptrs, owner));
         const char *out = static_cast<const char *>(params.o_ptr);
         head_tp_copy(payload + dst, out + src, dim * es, tid, nthreads);
         copied += 1;
@@ -535,8 +517,7 @@ __device__ void head_tp_after_combine(const Params &params, int bidx, int kBlock
         __syncthreads();
         if (tid == 0) {
             const int owner = params.head_tp_slot_rank[publish_token * dp];
-            int *arrived = static_cast<int *>(
-                head_tp_remote_or_local(params, params.head_tp_arrived_ptrs, params.head_tp_arrived_local, owner));
+            int *arrived = static_cast<int *>(head_tp_peer(params.head_tp_arrived_ptrs, owner));
             const int done = atomicAdd(params.head_tp_return_count + publish_token, copied);
             if (done + copied == publish_q_len) {
                 head_tp_store_release(
@@ -545,7 +526,7 @@ __device__ void head_tp_after_combine(const Params &params, int bidx, int kBlock
         }
         __syncthreads();
     }
-    if (splice_token >= 0 && params.head_tp_phase != 2) {
+    if (splice_token >= 0) {
         for (int slot = 1; slot < dp; ++slot) {
             head_tp_owner_splice<Element>(params, splice_token, slot, tid, nthreads);
         }

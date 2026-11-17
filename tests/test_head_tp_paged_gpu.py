@@ -11,8 +11,8 @@ if every row is padded to the max length; paged storage does.
 ``d = 4`` communication is not run. Two GPUs can only time ``d = 2``.
 
 Peer buffers default to ``EnablePeerAccess`` + foreign ``data_ptr``. On
-sm_120 / RTX 5090 (or ``P2P_BACKEND=memcpy``) the kernel writes local
-payloads and the host moves them with ``cudaMemcpyPeer``.
+sm_120 / RTX 5090 (or ``P2P_BACKEND=ipc``) they use CUDA IPC opened
+pointers instead; see ``cuda_ipc_p2p.py``.
 """
 
 import importlib.util
@@ -55,27 +55,26 @@ def _page_tests():
                 print(f"page {name}.{attr} ok", flush=True)
 
 
-_MEMCPY = False
+_IPC = None
 
 
 def _enable_peers():
     """Enable cross-GPU access for the head-TP exchange buffers.
 
-    Default is raw ``EnablePeerAccess`` + foreign ``data_ptr``. On sm_120 /
-    5090, or when ``P2P_BACKEND=memcpy``, payloads stay local and the host
-    copies them with ``cudaMemcpyPeer``.
+    Default is raw ``EnablePeerAccess`` + foreign ``data_ptr`` (historical).
+    On sm_120 / 5090, or when ``P2P_BACKEND=ipc``, use CUDA IPC opened
+    pointers for kernel stores. See ``cuda_ipc_p2p.py``.
     """
-    global _MEMCPY
+    global _IPC
     if torch.cuda.device_count() < 2:
         raise SystemExit("two CUDA devices are required")
     import cuda_ipc_p2p as ipc
 
     backend = ipc.enable_peers([0, 1])
-    _MEMCPY = backend == "memcpy"
-    if _MEMCPY:
-        os.environ["P2P_BACKEND"] = "memcpy"
+    if backend == "ipc":
+        _IPC = ipc.IpcPeerMesh([0, 1])
     else:
-        os.environ.pop("HEAD_TP_PHASE", None)
+        _IPC = None
 
 
 def _ops():
@@ -328,16 +327,10 @@ def _varlen(ops, q, k, v, block_table, seqused, cu_q, cu_k, max_k, out, row_kind
 
 
 def _pointers(buffers, device):
+    if _IPC is not None:
+        writer = device if isinstance(device, int) else device.index
+        return _IPC.pointer_table(list(buffers), int(writer), device=torch.device("cuda", writer))
     return torch.tensor([buf.data_ptr() for buf in buffers], dtype=torch.int64, device=device)
-
-
-def _copy_rank_plane(buffers, src):
-    """Move rank ``src``'s local payload plane onto the other GPU."""
-    from cuda_ipc_p2p import memcpy_peer
-
-    dst = PARTNER if src == OWNER else OWNER
-    for buf in buffers:
-        memcpy_peer(buf[dst][src], buf[src][src])
 
 
 def _plan(n, n_long, device):
@@ -489,6 +482,17 @@ class _Case:
             self.k_token_partner[: self.n_long] = k_token[: self.n_long]
             self.v_token_partner[: self.n_long] = v_token[: self.n_long]
         self.payload_tokens = tokens
+        if _IPC is not None:
+            for group in (
+                self.arrived, self.return_count, self.payload_q, self.payload_k,
+                self.payload_v, self.payload_out,
+            ):
+                for tensor in group:
+                    _IPC.export(tensor)
+            _IPC.export(self.k_token)
+            _IPC.export(self.v_token)
+            _IPC.export(self.k_token_partner)
+            _IPC.export(self.v_token_partner)
 
     def _xchg(self, src):
         device = PARTNER if src == PARTNER else OWNER
@@ -546,31 +550,8 @@ class _Case:
         self._launch(self.s1, self.partner, self.partner_out, self.partner_plan, 1, -1, None, starts, ends, 1)
 
     def _std_timed(self, starts, ends):
-        if not _MEMCPY:
-            self._launch(self.s0, self.owner, self.owner_out, self.owner_plan, 0, OWNER, self._xchg(OWNER), starts, ends, 0)
-            self._launch(self.s1, self.partner, self.partner_out, self.partner_plan, 1, PARTNER, self._xchg(PARTNER), starts, ends, 1)
-            return
-        # Send writes a local plane. Compute waits on that plane. The return
-        # is copied before the owner splice, which is a third launch.
-        planes = (self.payload_q, self.payload_k, self.payload_v, self.arrived)
-        os.environ["HEAD_TP_PHASE"] = "send"
-        self._launch(self.s0, self.owner, self.owner_out, self.owner_plan, 0, OWNER, self._xchg(OWNER), starts, None, 0)
-        self._launch(self.s1, self.partner, self.partner_out, self.partner_plan, 1, PARTNER, self._xchg(PARTNER), starts, None, 1)
-        self.s0.synchronize()
-        self.s1.synchronize()
-        for src in (OWNER, PARTNER):
-            _copy_rank_plane(planes, src)
-        os.environ["HEAD_TP_PHASE"] = "compute"
-        self._launch(self.s0, self.owner, self.owner_out, self.owner_plan, 0, OWNER, self._xchg(OWNER), None, None, 0)
-        self._launch(self.s1, self.partner, self.partner_out, self.partner_plan, 1, PARTNER, self._xchg(PARTNER), None, None, 1)
-        self.s0.synchronize()
-        self.s1.synchronize()
-        for src in (OWNER, PARTNER):
-            _copy_rank_plane((self.payload_out, self.arrived), src)
-        os.environ["HEAD_TP_PHASE"] = "splice"
-        self._launch(self.s0, self.owner, self.owner_out, self.owner_plan, 0, OWNER, self._xchg(OWNER), None, ends, 0)
-        self._launch(self.s1, self.partner, self.partner_out, self.partner_plan, 1, PARTNER, self._xchg(PARTNER), None, ends, 1)
-        os.environ.pop("HEAD_TP_PHASE", None)
+        self._launch(self.s0, self.owner, self.owner_out, self.owner_plan, 0, OWNER, self._xchg(OWNER), starts, ends, 0)
+        self._launch(self.s1, self.partner, self.partner_out, self.partner_plan, 1, PARTNER, self._xchg(PARTNER), starts, ends, 1)
 
     def _launch(self, stream, batch, out, plan, kv_begin, src, xchg, starts, ends, index):
         row_kind = plan[0]
