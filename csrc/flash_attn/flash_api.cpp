@@ -578,6 +578,10 @@ mha_fwd(Tensor q,         // batch_size x seqlen_q x num_heads x round_multiple(
     return {out, softmax_lse};
 }
 
+// Defined in flash_fwd_head_tp_splice.cu. One block per token copies the
+// partner Q heads. It does not read KV.
+void head_tp_launch_splice(const Flash_fwd_params &params, cudaStream_t stream, bool bf16);
+
 std::vector<Tensor>
 mha_varlen_fwd(Tensor q,  // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
                const Tensor &k,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
@@ -973,6 +977,23 @@ mha_varlen_fwd(Tensor q,  // total_q x num_heads x head_size, total_q := \sum_{i
     // }
 
     set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
+
+    // Compute already wrote this rank's heads into the user output. Splice
+    // only copies the partner heads there. Running attention again would scan
+    // KV, and the GQA transpose would copy a fresh temporary over those heads.
+    if (params.head_tp_memcpy && params.head_tp_phase == 3 &&
+        !(seqlenq_ngroups_swapped && !out_.has_value())) {
+        auto stream = get_current_cuda_stream(q);
+        Flash_fwd_params splice_params = params;
+        Tensor result = out;
+        if (seqlenq_ngroups_swapped) {
+            result = out_.value();
+            splice_params.o_ptr = result.data_ptr();
+            splice_params.seqlenq_ngroups_swapped = false;
+        }
+        head_tp_launch_splice(splice_params, stream, params.is_bf16);
+        return {result, softmax_lse};
+    }
 
     if (max_seqlen_k > 0) {
         auto stream = get_current_cuda_stream(q);

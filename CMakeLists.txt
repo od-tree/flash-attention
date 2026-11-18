@@ -160,7 +160,8 @@ if (FA2_ENABLED)
             csrc/flash_attn/src/flash_fwd_split_hdim256_bf16_sm80.cu
             csrc/flash_attn/src/flash_fwd_split_hdim256_bf16_causal_sm80.cu
             csrc/flash_attn/src/flash_fwd_split_align_hdim256_bf16_sm80.cu
-            csrc/flash_attn/src/flash_fwd_split_align_hdim256_bf16_causal_sm80.cu)
+            csrc/flash_attn/src/flash_fwd_split_align_hdim256_bf16_causal_sm80.cu
+            csrc/flash_attn/src/flash_fwd_head_tp_splice.cu)
         set(FA2_SPARSE_API "")
     else()
         file(GLOB FA2_GEN_SRCS "csrc/flash_attn/src/flash_fwd_*.cu")
