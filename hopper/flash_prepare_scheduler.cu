@@ -49,6 +49,7 @@ __global__ void prepare_varlen_num_blocks_kernel(
         int* const tile_count_semaphore,
         int* const prepare_seqlen_q_ptr,
         int* const num_splits_dynamic_ptr,
+        int const* const requested_split_counts,
         int* const varlen_batch_idx_ptr,
         // int* const num_n_blocks_ptr,
         int* const num_nheads_in_l2_ptr,
@@ -141,7 +142,16 @@ __global__ void prepare_varlen_num_blocks_kernel(
     };
     
     int num_splits_dynamic;
-    if (int(gridDim.x) > 1 || num_splits_static == 1) {
+    if (requested_split_counts != nullptr) {
+        num_splits_dynamic = 1;
+        if (num_n_blocks > 0) {
+            int const requested = std::max(1, std::min(requested_split_counts[batch_idx], num_splits_static));
+            int const blocks_per_split = cutlass::ceil_div(num_n_blocks, requested);
+            // Preserve the maximum chunk size while removing empty tail splits.
+            num_splits_dynamic = cutlass::ceil_div(num_n_blocks, blocks_per_split);
+            num_n_blocks = blocks_per_split;
+        }
+    } else if (int(gridDim.x) > 1 || num_splits_static == 1) {
         // set num splits for all batches to 1 (note that user expects num_splits_static to mean upper bound on splits)
         // for batch size > 992, we expect GPU occupancy to not be an issue except in degenerate cases (e.g., most are zero-length)
         num_splits_dynamic = 1;
@@ -238,6 +248,7 @@ void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bo
                 params.tile_count_semaphore,
                 params.prepare_seqlen_q_ptr,
                 params.num_splits_dynamic_ptr,
+                params.requested_split_counts,
                 params.varlen_batch_idx_ptr,
                 // params.num_n_blocks_ptr,
                 params.num_nheads_in_l2_ptr,

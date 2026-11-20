@@ -64,7 +64,8 @@ mha_fwd(Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens
         const std::optional<Tensor> &s_aux_,
         int const cp_world_size,
         int const cp_rank,
-        const std::optional<Tensor> &cp_tot_seqused_k
+        const std::optional<Tensor> &cp_tot_seqused_k,
+        const std::optional<Tensor> &row_split_counts
 );
 
 // Only applicable to the case where seqused_k (i.e. cache_seqlens) is available
@@ -157,7 +158,8 @@ std::vector<Tensor> mha_fwd_stable(
     std::optional<Tensor> s_aux,
     int64_t cp_world_size,
     int64_t cp_rank,
-    std::optional<Tensor> cp_tot_seqused_k) {
+    std::optional<Tensor> cp_tot_seqused_k,
+    std::optional<Tensor> row_split_counts) {
   return mha_fwd(
       q, k, v,
       k_new,
@@ -193,7 +195,8 @@ std::vector<Tensor> mha_fwd_stable(
       s_aux,
       narrow_int64_to_int(cp_world_size, "cp_world_size"),
       narrow_int64_to_int(cp_rank, "cp_rank"),
-      cp_tot_seqused_k);
+      cp_tot_seqused_k,
+      row_split_counts);
 }
 
 Tensor mha_fwd_get_scheduler_metadata_stable(
@@ -288,7 +291,8 @@ STABLE_TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
             "    Tensor?  s_aux,"
             "    int      cp_world_size,"
             "    int      cp_rank,"
-            "    Tensor?  cp_tot_seqused_k) -> Tensor[]");
+            "    Tensor?  cp_tot_seqused_k,"
+            "    Tensor?  row_split_counts=None) -> Tensor[]");
 
     ops.def("get_scheduler_metadata("
             "    int      batch_size,"

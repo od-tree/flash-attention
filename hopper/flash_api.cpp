@@ -771,7 +771,8 @@ mha_fwd(Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens
         const std::optional<Tensor> &s_aux_, // (h)
         int const cp_world_size,  // context parallelism (cp) world size
         int const cp_rank,         // cp rank
-        const std::optional<Tensor> &cp_tot_seqused_k_ // b. total seqused_k in cp world
+        const std::optional<Tensor> &cp_tot_seqused_k_, // b. total seqused_k in cp world
+        const std::optional<Tensor> &row_split_counts_
         ) {
 
     auto dprops = get_device_prop();
@@ -1065,9 +1066,28 @@ mha_fwd(Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens
     params.pack_gqa |= params.d == params.dv;
     #endif
 
-    bool const use_dynamic_split = use_prepare_varlen && params.b <= PREPARE_VARLEN_MAX_BATCHES_1CTA && params.num_splits > 1;
-    // disable split for varlen and >992 batches for now
-    if (use_prepare_varlen && params.b > PREPARE_VARLEN_MAX_BATCHES_1CTA) { params.num_splits = 1; }
+    bool const explicit_splits = row_split_counts_.has_value();
+    if (explicit_splits) {
+        const auto &counts = row_split_counts_.value();
+        CHECK_DEVICE(counts); CHECK_CONTIGUOUS(counts);
+        CHECK_SHAPE(counts, batch_size);
+        STD_TORCH_CHECK(counts.scalar_type() == ScalarType::Int &&
+                        counts.get_device_index() == q.get_device_index(),
+                        "row_split_counts must be int32 on the query device");
+        STD_TORCH_CHECK(params.arch == 90 && paged_KV && seqused_k_.has_value() &&
+                        seqlen_q == 1 && !params.is_local && cp_world_size == 1,
+                        "row_split_counts requires Hopper single-token paged attention with cache lengths");
+        STD_TORCH_CHECK(!scheduler_metadata_.has_value(),
+                        "row_split_counts and scheduler_metadata are mutually exclusive");
+        STD_TORCH_CHECK(num_splits >= 1 && num_splits <= 128,
+                        "row_split_counts requires an explicit split bound in [1, 128]");
+        params.requested_split_counts = static_cast<int const *>(counts.data_ptr());
+    }
+    bool const auto_split = params.b <= PREPARE_VARLEN_MAX_BATCHES_1CTA;
+    bool const use_dynamic_split = use_prepare_varlen && (auto_split || explicit_splits) && params.num_splits > 1;
+    // Auto splits require a batch-wide reduction in the metadata CTA. An
+    // explicit plan only reads per-row values and works with multiple CTAs.
+    if (use_prepare_varlen && !auto_split && !explicit_splits) { params.num_splits = 1; }
 
     // This needs to be set after get_num_splits
     Tensor tile_count_semaphore;  // Contains the semaphore and optionally num_splits_dynamic

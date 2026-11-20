@@ -473,6 +473,9 @@ __device__ void head_tp_after_combine(const Params &params, int bidx, int kBlock
     if (!head_tp_exchange_on(params) || !params.seqlenq_ngroups_swapped) {
         return;
     }
+    // The combine store and the payload copy use different thread-to-column
+    // mappings. Finish all stores in this CTA before reading its output.
+    __syncthreads();
     const int span = params.b * params.h * params.seqlen_q;
     const int group = params.head_tp_q_per_kv > 1 ? params.head_tp_q_per_kv : 1;
     const int dp = params.head_tp_dp_size;
