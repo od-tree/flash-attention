@@ -65,7 +65,8 @@ mha_fwd(Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens
         int const cp_world_size,
         int const cp_rank,
         const std::optional<Tensor> &cp_tot_seqused_k,
-        const std::optional<Tensor> &row_split_counts
+        const std::optional<Tensor> &row_split_counts,
+        bool prepared_row_splits
 );
 
 // Only applicable to the case where seqused_k (i.e. cache_seqlens) is available
@@ -93,7 +94,8 @@ mha_fwd_get_scheduler_metadata(
         bool has_softcap,
         int num_splits,
         std::optional<bool> pack_gqa_,
-        int const sm_margin
+        int const sm_margin,
+        const std::optional<Tensor> &row_split_counts
 );
 
 namespace {
@@ -159,7 +161,8 @@ std::vector<Tensor> mha_fwd_stable(
     int64_t cp_world_size,
     int64_t cp_rank,
     std::optional<Tensor> cp_tot_seqused_k,
-    std::optional<Tensor> row_split_counts) {
+    std::optional<Tensor> row_split_counts,
+    bool prepared_row_splits) {
   return mha_fwd(
       q, k, v,
       k_new,
@@ -196,7 +199,7 @@ std::vector<Tensor> mha_fwd_stable(
       narrow_int64_to_int(cp_world_size, "cp_world_size"),
       narrow_int64_to_int(cp_rank, "cp_rank"),
       cp_tot_seqused_k,
-      row_split_counts);
+      row_split_counts, prepared_row_splits);
 }
 
 Tensor mha_fwd_get_scheduler_metadata_stable(
@@ -222,7 +225,7 @@ Tensor mha_fwd_get_scheduler_metadata_stable(
     bool has_softcap,
     int64_t num_splits,
     std::optional<bool> pack_gqa,
-    int64_t sm_margin) {
+    int64_t sm_margin, std::optional<Tensor> row_split_counts) {
   return mha_fwd_get_scheduler_metadata(
       narrow_int64_to_int(batch_size, "batch_size"),
       narrow_int64_to_int(max_seqlen_q, "max_seqlen_q"),
@@ -246,7 +249,7 @@ Tensor mha_fwd_get_scheduler_metadata_stable(
       has_softcap,
       narrow_int64_to_int(num_splits, "num_splits"),
       pack_gqa,
-      narrow_int64_to_int(sm_margin, "sm_margin"));
+      narrow_int64_to_int(sm_margin, "sm_margin"), row_split_counts);
 }
 
 } // namespace
@@ -292,7 +295,7 @@ STABLE_TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
             "    int      cp_world_size,"
             "    int      cp_rank,"
             "    Tensor?  cp_tot_seqused_k,"
-            "    Tensor?  row_split_counts=None) -> Tensor[]");
+            "    Tensor?  row_split_counts=None, bool prepared_row_splits=False) -> Tensor[]");
 
     ops.def("get_scheduler_metadata("
             "    int      batch_size,"
@@ -317,7 +320,7 @@ STABLE_TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
             "    bool     has_softcap,"
             "    int      num_splits,"
             "    bool?    pack_gqa,"
-            "    int      sm_margin) -> Tensor");
+            "    int      sm_margin, Tensor? row_split_counts=None) -> Tensor");
 }
 
 STABLE_TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, CUDA, ops) {

@@ -579,6 +579,15 @@ inline int round_up_headdimv(int head_size) {
     return 512;
 }
 
+static void set_requested_splits(Flash_fwd_params &params, Tensor const &counts,
+                                 int batch_size, Tensor const &reference) {
+    CHECK_DEVICE(counts); CHECK_CONTIGUOUS(counts); CHECK_SHAPE(counts, batch_size);
+    STD_TORCH_CHECK(counts.scalar_type() == ScalarType::Int &&
+                    counts.get_device_index() == reference.get_device_index(),
+                    "row_split_counts must be int32 on the attention device");
+    params.requested_split_counts = static_cast<int const *>(counts.data_ptr());
+}
+
 // Only applicable to the case where seqused_k (i.e. cache_seqlens) is available
 Tensor
 mha_fwd_get_scheduler_metadata(
@@ -604,7 +613,8 @@ mha_fwd_get_scheduler_metadata(
         bool has_softcap,
         int num_splits,
         std::optional<bool> pack_gqa_,
-        int const sm_margin
+        int const sm_margin,
+        const std::optional<Tensor> &row_split_counts_
         ) {
 
     STD_TORCH_CHECK(qkv_dtype == ScalarType::Half || qkv_dtype == ScalarType::BFloat16 || qkv_dtype == ScalarType::Float8_e4m3fn,
@@ -612,6 +622,7 @@ mha_fwd_get_scheduler_metadata(
     STD_TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
     // Reset the parameters
+    auto device_guard = make_cuda_guard_from_tensor(seqused_k);
     Flash_fwd_params params{};
     params.is_bf16 = qkv_dtype == ScalarType::BFloat16;
     params.is_e4m3 = qkv_dtype == ScalarType::Float8_e4m3fn;
@@ -674,13 +685,19 @@ mha_fwd_get_scheduler_metadata(
     params.pack_gqa |= params.d == params.dv;
     #endif
 
-    bool const use_dynamic_split = params.b <= PREPARE_VARLEN_MAX_BATCHES_1CTA && params.num_splits > 1;
+    if (row_split_counts_.has_value()) {
+        STD_TORCH_CHECK(params.arch == 90 && page_size.has_value() && max_seqlen_q == 1 &&
+                        !params.is_local && num_splits >= 1 && num_splits <= 128,
+                        "explicit splits require Hopper paged decode and a split bound in [1, 128]");
+        set_requested_splits(params, row_split_counts_.value(), batch_size, seqused_k);
+    }
+    bool const use_dynamic_split = (params.b <= PREPARE_VARLEN_MAX_BATCHES_1CTA ||
+                                    row_split_counts_.has_value()) && params.num_splits > 1;
 
     bool is_varlen = true;
 
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing
-    auto device_guard = make_cuda_guard_from_tensor(seqused_k);
     // This needs to be set after get_num_splits
     Tensor tile_count_semaphore;  // Contains the semaphore and optionally num_splits_dynamic
     bool const scheduler_needs_semaphore = params.arch >= 90 || params.num_splits > 1;
@@ -772,7 +789,8 @@ mha_fwd(Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens
         int const cp_world_size,  // context parallelism (cp) world size
         int const cp_rank,         // cp rank
         const std::optional<Tensor> &cp_tot_seqused_k_, // b. total seqused_k in cp world
-        const std::optional<Tensor> &row_split_counts_
+        const std::optional<Tensor> &row_split_counts_,
+        bool prepared_row_splits
         ) {
 
     auto dprops = get_device_prop();
@@ -1066,22 +1084,20 @@ mha_fwd(Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens
     params.pack_gqa |= params.d == params.dv;
     #endif
 
-    bool const explicit_splits = row_split_counts_.has_value();
+    bool const explicit_splits = row_split_counts_.has_value() || prepared_row_splits;
+    STD_TORCH_CHECK(!prepared_row_splits || scheduler_metadata_.has_value(),
+                    "prepared_row_splits requires scheduler_metadata");
     if (explicit_splits) {
-        const auto &counts = row_split_counts_.value();
-        CHECK_DEVICE(counts); CHECK_CONTIGUOUS(counts);
-        CHECK_SHAPE(counts, batch_size);
-        STD_TORCH_CHECK(counts.scalar_type() == ScalarType::Int &&
-                        counts.get_device_index() == q.get_device_index(),
-                        "row_split_counts must be int32 on the query device");
         STD_TORCH_CHECK(params.arch == 90 && paged_KV && seqused_k_.has_value() &&
                         seqlen_q == 1 && !params.is_local && cp_world_size == 1,
-                        "row_split_counts requires Hopper single-token paged attention with cache lengths");
+                        "explicit splits require Hopper single-token paged attention with cache lengths");
+        STD_TORCH_CHECK(num_splits >= 1 && num_splits <= 128,
+                        "explicit splits require a split bound in [1, 128]");
+    }
+    if (row_split_counts_.has_value()) {
         STD_TORCH_CHECK(!scheduler_metadata_.has_value(),
                         "row_split_counts and scheduler_metadata are mutually exclusive");
-        STD_TORCH_CHECK(num_splits >= 1 && num_splits <= 128,
-                        "row_split_counts requires an explicit split bound in [1, 128]");
-        params.requested_split_counts = static_cast<int const *>(counts.data_ptr());
+        set_requested_splits(params, row_split_counts_.value(), batch_size, q);
     }
     bool const auto_split = params.b <= PREPARE_VARLEN_MAX_BATCHES_1CTA;
     bool const use_dynamic_split = use_prepare_varlen && (auto_split || explicit_splits) && params.num_splits > 1;
@@ -1113,6 +1129,7 @@ mha_fwd(Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens
         if (scheduler_metadata_.has_value()) {
             Tensor scheduler_metadata = scheduler_metadata_.value();
             CHECK_DEVICE(scheduler_metadata);
+            STD_TORCH_CHECK(scheduler_metadata.get_device_index() == q.get_device_index(), "scheduler_metadata must be on the query device");
             CHECK_SHAPE(scheduler_metadata, metadata_size);
             CHECK_CONTIGUOUS(scheduler_metadata);
             STD_TORCH_CHECK(scheduler_metadata.scalar_type() == ScalarType::Int, "scheduler_metadata must have dtype int32");
