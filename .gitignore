@@ -37,8 +37,6 @@ var/
 # Dev
 venv
 agent_space/
-result/
-results/
 
 # compile-time generated file
 flash_attn_config.py
